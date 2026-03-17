@@ -1,0 +1,27 @@
+[project]
+name = "rl-example"
+version = "0.1.0"
+description = "Doosan M1013 6-DOF robot arm reinforcement learning with MuJoCo + PPO"
+requires-python = ">=3.12"
+dependencies = [
+    "mujoco>=3.0.0",
+    "gymnasium>=1.0.0",
+    "stable-baselines3[extra]>=2.0.0",
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "tensorboard>=2.14.0",
+    "matplotlib>=3.7.0",
+    "ipython>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*.py"]

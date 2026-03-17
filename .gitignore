@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# MuJoCo / simulation artifacts
+*.mjb
+*.mjtb
+
+# Trained models & checkpoints
+models/
+!models/.gitkeep
+
+# Training logs
+logs/
+!logs/.gitkeep
+
+# Evaluation outputs
+results/
+videos/
+*.mp4
+*.gif
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+.env
+*.log
