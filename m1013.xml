@@ -142,14 +142,15 @@
     </body>
   </worldbody>
 
-  <!-- Actuators: gear = effort limit from URDF -->
+  <!-- Position actuators: ctrl = target angle, PD control internally -->
+  <!-- kp 낮춤 (부드러운 응답), kv 높임 (진동 억제 & 감속) -->
   <actuator>
-    <motor name="act1" joint="joint1" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
-    <motor name="act2" joint="joint2" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
-    <motor name="act3" joint="joint3" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
-    <motor name="act4" joint="joint4" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
-    <motor name="act5" joint="joint5" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
-    <motor name="act6" joint="joint6" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
+    <position name="act1" joint="joint1" kp="500"  kv="100" ctrlrange="-6.2832 6.2832"/>
+    <position name="act2" joint="joint2" kp="700"  kv="140" ctrlrange="-6.2832 6.2832"/>
+    <position name="act3" joint="joint3" kp="500"  kv="100" ctrlrange="-2.7925 2.7925"/>
+    <position name="act4" joint="joint4" kp="200"  kv="50"  ctrlrange="-6.2832 6.2832"/>
+    <position name="act5" joint="joint5" kp="200"  kv="50"  ctrlrange="-6.2832 6.2832"/>
+    <position name="act6" joint="joint6" kp="70"   kv="20"  ctrlrange="-6.2832 6.2832"/>
   </actuator>
 
 </mujoco>

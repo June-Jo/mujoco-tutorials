@@ -22,26 +22,54 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
-class SuccessRateCallback(BaseCallback):
-    """에피소드 성공률을 주기적으로 출력."""
+class CurriculumCallback(BaseCallback):
+    """
+    성공률 기반 Curriculum Learning 콜백.
+    - 성공률 >= 50% : curriculum level +0.05
+    - 성공률 <  20% : curriculum level -0.02
+    """
 
-    def __init__(self, print_freq=200, verbose=0):
+    def __init__(self, print_freq=500, init_level=0.0, verbose=0):
         super().__init__(verbose)
         self.successes = []
         self.episodes = 0
+        self._last_logged_ep = 0
         self.print_freq = print_freq
+        self.curriculum_level = init_level
+
+    def _set_level(self, level: float):
+        self.curriculum_level = float(np.clip(level, 0.0, 1.0))
+        for env in self.training_env.envs:
+            unwrapped = env
+            while hasattr(unwrapped, "env"):
+                unwrapped = unwrapped.env
+            unwrapped.set_curriculum_level(self.curriculum_level)
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
-            if "success" in info:
-                self.successes.append(float(info["success"]))
+            # "episode" key is added by Monitor only when an episode completes
+            if "episode" in info:
+                self.successes.append(float(info.get("success", False)))
                 self.episodes += 1
 
-        if self.episodes > 0 and self.episodes % self.print_freq == 0:
-            recent = self.successes[-400:] if len(self.successes) >= 400 else self.successes
+        if self.episodes >= self._last_logged_ep + self.print_freq:
+            recent = self.successes[-self.print_freq:]
             rate = np.mean(recent) * 100
-            print(f"  [Ep {self.episodes:>7d}] 성공률(최근 {len(recent)}): {rate:5.1f}%")
+
+            if rate >= 50.0:
+                self._set_level(self.curriculum_level + 0.05)
+            elif rate < 20.0 and self.curriculum_level > 0.0:
+                self._set_level(self.curriculum_level - 0.02)
+
+            max_r = 0.08 + (0.80 - 0.08) * self.curriculum_level
+            print(
+                f"  [Ep {self.episodes:>7d}] "
+                f"성공률: {rate:5.1f}% | "
+                f"level: {self.curriculum_level:.2f} (max_r={max_r:.2f}m)"
+            )
+            self._last_logged_ep = self.episodes
             self.logger.record("train/success_rate", rate)
+            self.logger.record("train/curriculum_level", self.curriculum_level)
 
         return True
 
@@ -51,7 +79,7 @@ def make_env(env_id="M1013Reach-v0"):
     return Monitor(env)
 
 
-def train(total_timesteps: int = 1_000_000, n_envs: int = 8):
+def train(total_timesteps: int = 1_000_000, n_envs: int = 8, resume: str = None):
     print("=" * 65)
     print("  Doosan M1013 Reach Task — PPO 학습")
     print("=" * 65)
@@ -59,29 +87,32 @@ def train(total_timesteps: int = 1_000_000, n_envs: int = 8):
     vec_env  = make_vec_env(make_env, n_envs=n_envs)
     eval_env = make_vec_env(make_env, n_envs=1)
 
-    model = PPO(
-        policy="MlpPolicy",
-        env=vec_env,
-        # ── 학습률 스케줄 (초반 빠르게, 후반 안정적으로)
-        learning_rate=lambda f: 3e-4 * f,   # f: 1→0 as training progresses
-        n_steps=2048,
-        batch_size=256,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        clip_range_vf=None,
-        ent_coef=0.005,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        policy_kwargs=dict(
-            net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
-            log_std_init=-1.0,
-        ),
-        tensorboard_log=LOG_DIR,
-        device="cpu",   # MLP policy는 CPU가 더 빠름
-        verbose=1,
-    )
+    if resume and os.path.exists(resume + ".zip"):
+        print(f"이어서 학습: {resume}")
+        model = PPO.load(resume, env=vec_env, device="cpu", tensorboard_log=LOG_DIR)
+    else:
+        model = PPO(
+            policy="MlpPolicy",
+            env=vec_env,
+            learning_rate=lambda f: 3e-4 * f,
+            n_steps=2048,
+            batch_size=256,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            clip_range_vf=None,
+            ent_coef=0.005,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            policy_kwargs=dict(
+                net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
+                log_std_init=-1.0,
+            ),
+            tensorboard_log=LOG_DIR,
+            device="cpu",
+            verbose=1,
+        )
 
     print(f"\n환경 정보:")
     print(f"  Env ID:             M1013Reach-v0")
@@ -106,7 +137,7 @@ def train(total_timesteps: int = 1_000_000, n_envs: int = 8):
         save_path=MODEL_DIR,
         name_prefix="ppo_m1013",
     )
-    success_callback = SuccessRateCallback(print_freq=500, verbose=1)
+    success_callback = CurriculumCallback(print_freq=500, init_level=0.0, verbose=1)
 
     model.learn(
         total_timesteps=total_timesteps,
@@ -130,6 +161,8 @@ if __name__ == "__main__":
                         help="총 학습 스텝 (기본값: 1,000,000)")
     parser.add_argument("--envs",  type=int, default=8,
                         help="병렬 환경 수 (기본값: 8)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="이어서 학습할 모델 경로 (예: models/best_model)")
     args = parser.parse_args()
 
-    train(total_timesteps=args.steps, n_envs=args.envs)
+    train(total_timesteps=args.steps, n_envs=args.envs, resume=args.resume)
