@@ -7,18 +7,33 @@ import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO
 import robot_env  # M1013Reach-v0 등록
+from robot_env import RobotArmBaseEnv
 
 
-def evaluate(model_path: str, n_episodes: int = 20, render: bool = False):
+def evaluate(model_path: str, n_episodes: int = 20, render: bool = False,
+             control_mode: str = "position"):
     print(f"\n모델 로드: {model_path}")
     model = PPO.load(model_path)
 
-    env = gym.make("M1013Reach-v0", render_mode="human" if render else None)
+    env_id = "M1013Reach-v0" if control_mode == "position" else "M1013Reach-Torque-v0"
+    env = gym.make(env_id, render_mode="human" if render else None)
+
+    # success_threshold 복원
+    model_dir = os.path.join("models", control_mode)
+    threshold_path = os.path.join(model_dir, "success_threshold.txt")
+    if os.path.exists(threshold_path):
+        with open(threshold_path) as f:
+            threshold = float(f.read().strip())
+        env.unwrapped.set_success_threshold(threshold)
+        print(f"  Success threshold: {threshold*100:.2f}cm")
+    else:
+        threshold = RobotArmBaseEnv.SUCCESS_THRESHOLD_INIT
+        print(f"  Success threshold: {threshold*100:.2f}cm (기본값)")
 
     successes, distances, ep_rewards = [], [], []
 
     print(f"\n{'─'*55}")
-    print(f"  평가: {n_episodes} 에피소드 | 성공 기준: 5cm 이내")
+    print(f"  평가: {n_episodes} 에피소드 | 성공 기준: {threshold*100:.1f}cm 이내")
     print(f"{'─'*55}")
 
     for ep in range(n_episodes):
@@ -50,10 +65,11 @@ def evaluate(model_path: str, n_episodes: int = 20, render: bool = False):
     env.close()
 
 
-def demo_random(n_steps: int = 300):
+def demo_random(n_steps: int = 300, control_mode: str = "position"):
     """랜덤 에이전트로 환경 동작 확인."""
-    print("\nM1013 환경 확인 (랜덤 에이전트)...")
-    env = gym.make("M1013Reach-v0")
+    env_id = "M1013Reach-v0" if control_mode == "position" else "M1013Reach-Torque-v0"
+    print(f"\nM1013 환경 확인 (랜덤 에이전트, {control_mode})...")
+    env = gym.make(env_id)
     obs, info = env.reset()
 
     print(f"  Obs dim:    {obs.shape[0]}")
@@ -81,17 +97,23 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="models/best_model")
+    parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--random", action="store_true")
+    parser.add_argument("--torque", action="store_true", help="토크 제어 모드")
     args = parser.parse_args()
 
+    control_mode = "torque" if args.torque else "position"
+    default_model = f"models/{control_mode}/best_model"
+    model_path = args.model or default_model
+
     if args.random:
-        demo_random()
-    elif os.path.exists(args.model + ".zip") or os.path.exists(args.model):
-        evaluate(args.model, n_episodes=args.episodes, render=args.render)
+        demo_random(control_mode=control_mode)
+    elif os.path.exists(model_path + ".zip") or os.path.exists(model_path):
+        evaluate(model_path, n_episodes=args.episodes, render=args.render,
+                 control_mode=control_mode)
     else:
-        print(f"모델 없음: {args.model}")
+        print(f"모델 없음: {model_path}")
         print("먼저 python train.py 를 실행하세요.\n")
-        demo_random()
+        demo_random(control_mode=control_mode)
