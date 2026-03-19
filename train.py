@@ -125,7 +125,7 @@ def train(total_timesteps: int = 1_000_000, n_envs: int = 8, resume: str = None,
             gae_lambda=0.95,
             clip_range=0.2,
             clip_range_vf=None,
-            ent_coef=0.02,
+            ent_coef=0.03,
             vf_coef=0.5,
             max_grad_norm=0.5,
             policy_kwargs=dict(

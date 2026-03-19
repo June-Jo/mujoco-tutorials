@@ -30,6 +30,8 @@ class RobotArmBaseEnv(gym.Env):
         - 성공률 >= 70% → threshold 절반
         - 성공률 <  20% → threshold 2배 (최대 30cm)
         - 최소: 0.1mm (SUCCESS_THRESHOLD_MIN)
+
+    성공 조건: threshold 내에서 5초(250스텝) 연속 유지
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
@@ -44,7 +46,8 @@ class RobotArmBaseEnv(gym.Env):
     ])
 
     # 1스텝당 최대 관절 이동량 (rad) — position 제어 전용
-    MAX_DELTA = 0.05
+    # joint1, joint2는 탐색 범위를 넓혀 대형 이동을 장려
+    MAX_DELTA_PER_JOINT = np.array([0.10, 0.10, 0.05, 0.05, 0.05, 0.05])
 
     # 성공 threshold 범위
     SUCCESS_THRESHOLD_INIT = 0.30   # 30cm (시작)
@@ -53,7 +56,7 @@ class RobotArmBaseEnv(gym.Env):
 
     XML_FILE = None  # 서브클래스에서 지정
 
-    def __init__(self, render_mode=None, max_episode_steps=500):
+    def __init__(self, render_mode=None, max_episode_steps=1500):
         super().__init__()
 
         self.render_mode = render_mode
@@ -93,6 +96,8 @@ class RobotArmBaseEnv(gym.Env):
         self._target_pos = np.zeros(3)
         self._prev_dist = 0.0
         self._prev_action = np.zeros(self.n_joints)
+        self._no_progress_steps = 0
+        self._success_steps = 0  # threshold 내 유지 스텝 수 (5초 = 250스텝)
         self.success_threshold = self.SUCCESS_THRESHOLD_INIT
         self._renderer = None
 
@@ -149,26 +154,60 @@ class RobotArmBaseEnv(gym.Env):
             [dist],
         ]).astype(np.float32)
 
-    def _compute_reward(self, ee_pos: np.ndarray, action: np.ndarray) -> tuple[float, bool]:
-        dist = float(np.linalg.norm(self._target_pos - ee_pos))
-        success = dist < self.success_threshold
+    # 성공 판정: threshold 내 N스텝 유지
+    # hold 시간은 curriculum 진행에 따라 자동 증가:
+    #   30cm → 25스텝(0.5s), 15cm → 50스텝(1s), ... 최대 250스텝(5s)
+    SUCCESS_HOLD_MAX = 250
 
-        # 1. Potential shaping: 다가갈수록 즉각 양의 보상
+    def _required_hold_steps(self) -> int:
+        """현재 threshold에 따른 필요 hold 스텝 수 반환.
+        threshold 절반마다 2배 증가: 30cm→5스텝(0.1s), 15cm→10s, ..., 최대 250스텝(5s)"""
+        return min(
+            self.SUCCESS_HOLD_MAX,
+            max(5, int(5 * (self.SUCCESS_THRESHOLD_MAX / self.success_threshold)))
+        )
+
+    def _compute_reward(self, ee_pos: np.ndarray, action: np.ndarray) -> tuple[float, bool, bool]:
+        dist = float(np.linalg.norm(self._target_pos - ee_pos))
+        in_threshold = dist < self.success_threshold
+
+        # 1. 접근 보상: 거리가 줄어들수록 즉각 양의 보상
         reward = (self._prev_dist - dist) * 10.0
 
-        # 2. 성공 보너스
-        if success:
-            reward += 10.0
+        # 2. 근접 보너스: 가까울수록 지속적으로 보상 (dense signal)
+        reward += float(np.exp(-dist / 0.3))
 
-        # 3. 생존 페널티
+        # 3. 성공 유지 카운터 + 최종 성공 보너스
+        if in_threshold:
+            self._success_steps += 1
+        else:
+            self._success_steps = 0
+        success = self._success_steps >= self._required_hold_steps()
+        if success:
+            reward += 50.0  # hold 달성 보너스
+
+        # 4. 생존 페널티
         reward -= 0.01
 
-        # 4. Action smoothness
-        reward -= 0.001 * float(np.sum((action - self._prev_action) ** 2))
-        self._prev_action = action.copy()
+        # 5. 관절 한계 근접 패널티: 각 관절이 min/max에 가까울수록 페널티
+        qpos = self._get_joint_pos()
+        for i in range(self.n_joints):
+            dist_to_limit = min(
+                qpos[i] - self.JOINT_RANGES[i, 0],
+                self.JOINT_RANGES[i, 1] - qpos[i],
+            )
+            reward -= 0.01 * float(np.exp(-dist_to_limit / 0.3))
+
+        # 6. no-progress 감지 (threshold 밖에서만 카운트)
+        improvement = self._prev_dist - dist
+        if not in_threshold and improvement < 0.001:
+            self._no_progress_steps += 1
+        else:
+            self._no_progress_steps = 0
 
         self._prev_dist = dist
-        return reward, success
+        no_progress_truncate = self._no_progress_steps >= 150
+        return reward, success, no_progress_truncate
 
     # ── Gym API ──────────────────────────────────────────────────────
 
@@ -191,6 +230,8 @@ class RobotArmBaseEnv(gym.Env):
         self._step_count = 0
         self._prev_dist = float(np.linalg.norm(self._target_pos - self._get_ee_pos()))
         self._prev_action = np.zeros(self.n_joints)
+        self._no_progress_steps = 0
+        self._success_steps = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -228,7 +269,7 @@ class RobotArmPositionEnv(RobotArmBaseEnv):
 
     XML_FILE = "m1013_position.xml"
 
-    def __init__(self, render_mode=None, max_episode_steps=500):
+    def __init__(self, render_mode=None, max_episode_steps=1500):
         super().__init__(render_mode=render_mode, max_episode_steps=max_episode_steps)
         self._commanded_angles = np.zeros(self.n_joints)
 
@@ -245,7 +286,7 @@ class RobotArmPositionEnv(RobotArmBaseEnv):
         action = np.clip(action, -1.0, 1.0).astype(np.float64)
 
         self._commanded_angles = np.clip(
-            self._commanded_angles + action * self.MAX_DELTA,
+            self._commanded_angles + action * self.MAX_DELTA_PER_JOINT,
             self.JOINT_RANGES[:, 0],
             self.JOINT_RANGES[:, 1],
         )
@@ -255,13 +296,13 @@ class RobotArmPositionEnv(RobotArmBaseEnv):
             mujoco.mj_step(self.model, self.data)
 
         ee_pos = self._get_ee_pos()
-        reward, success = self._compute_reward(ee_pos, action)
+        reward, success, no_progress = self._compute_reward(ee_pos, action)
         obs = self._get_obs()
 
         self._step_count += 1
         dist = float(np.linalg.norm(self._target_pos - ee_pos))
         terminated = success
-        truncated = self._step_count >= self.max_episode_steps
+        truncated = self._step_count >= self.max_episode_steps or no_progress
 
         if self.render_mode == "human":
             self.render()
@@ -294,13 +335,13 @@ class RobotArmTorqueEnv(RobotArmBaseEnv):
             mujoco.mj_step(self.model, self.data)
 
         ee_pos = self._get_ee_pos()
-        reward, success = self._compute_reward(ee_pos, action)
+        reward, success, no_progress = self._compute_reward(ee_pos, action)
         obs = self._get_obs()
 
         self._step_count += 1
         dist = float(np.linalg.norm(self._target_pos - ee_pos))
         terminated = success
-        truncated = self._step_count >= self.max_episode_steps
+        truncated = self._step_count >= self.max_episode_steps or no_progress
 
         if self.render_mode == "human":
             self.render()
@@ -313,11 +354,11 @@ class RobotArmTorqueEnv(RobotArmBaseEnv):
 gym.register(
     id="M1013Reach-v0",
     entry_point="robot_env:RobotArmPositionEnv",
-    max_episode_steps=500,
+    max_episode_steps=1500,
 )
 
 gym.register(
     id="M1013Reach-Torque-v0",
     entry_point="robot_env:RobotArmTorqueEnv",
-    max_episode_steps=500,
+    max_episode_steps=1500,
 )
