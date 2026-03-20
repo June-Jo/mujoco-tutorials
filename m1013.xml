@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Doosan Robotics M1013 - MuJoCo MJCF (Torque control + Dynamic Obstacles)
+  Kinematic chain from: DoosanRobotics/doosan-robot2 (humble branch)
+  Visual meshes: dsr_description2/meshes/m1013_white/
+
+  Joint origins (URDF):
+    joint1: xyz="0 0 0.1525"  rpy="0 0 0"
+    joint2: xyz="0 0.0345 0"  rpy="0 -pi/2 -pi/2"   quat=(0.5,-0.5,-0.5,-0.5)
+    joint3: xyz="0.62 0 0"    rpy="0 0 pi/2"         quat=(0.7071,0,0,0.7071)
+    joint4: xyz="0 -0.559 0"  rpy="pi/2 0 0"         quat=(0.7071,0.7071,0,0)
+    joint5: xyz="0 0 0"       rpy="-pi/2 0 0"        quat=(0.7071,-0.7071,0,0)
+    joint6: xyz="0 -0.121 0"  rpy="pi/2 0 0"         quat=(0.7071,0.7071,0,0)
+  All joint axes = (0,0,1) in child body frame.
+
+  Dynamic Obstacles: 10 mocap slots, each with 3 geoms (sphere/box/capsule).
+    - 100개 풀에서 reset마다 무작위 샘플링 (robot_env.py 참조)
+    - 활성 geom만 rgba alpha=0.75, 나머지는 alpha=0 (투명)
+    - 크기는 runtime에 model.geom_size로 설정
+    - contype=0/conaffinity=0: 충돌은 Python에서 해석적으로 처리
+-->
+<mujoco model="doosan_m1013">
+
+  <compiler angle="radian" autolimits="true" meshdir="meshes/m1013_stl"/>
+
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.4 0.4 0.4" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="150" elevation="-25"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient"
+             rgb1="0.4 0.6 0.8" rgb2="0.05 0.05 0.05" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.2 0.2" rgb2="0.1 0.1 0.1" markrgb="0.6 0.6 0.6"
+             width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true"
+              texrepeat="4 4" reflectance="0.1"/>
+    <material name="target_mat" rgba="1.0 0.2 0.2 0.7"/>
+    <material name="ee_mat"     rgba="0.1 0.9 0.1 1.0"/>
+
+    <!-- M1013 White meshes (URDF scale=0.001) -->
+    <mesh name="base_mesh"   file="MF1013_0_0.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link1_mesh"  file="MF1013_1_0.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link2_mesh0" file="MF1013_2_0.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link2_mesh1" file="MF1013_2_1.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link2_mesh2" file="MF1013_2_2.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link3_mesh"  file="MF1013_3_0.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link4_mesh0" file="MF1013_4_0.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link4_mesh1" file="MF1013_4_1.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link5_mesh"  file="MF1013_5_0.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="link6_mesh"  file="MF1013_6_0.stl" scale="0.001 0.001 0.001"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" rgba="0 0 0 0"/>
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
+
+    <!-- Target marker (mocap) -->
+    <body name="target" pos="0.5 0.0 1.0" mocap="true">
+      <geom name="target_geom"   type="sphere"  size="0.025"
+            material="target_mat" contype="0" conaffinity="0"/>
+      <geom name="target_axis_x" type="capsule" fromto="0 0 0 0.08 0 0" size="0.005"
+            rgba="1.0 0.1 0.1 1.0" contype="0" conaffinity="0"/>
+      <geom name="target_axis_y" type="capsule" fromto="0 0 0 0 0.08 0" size="0.005"
+            rgba="0.1 1.0 0.1 1.0" contype="0" conaffinity="0"/>
+      <geom name="target_axis_z" type="capsule" fromto="0 0 0 0 0 0.08" size="0.005"
+            rgba="0.1 0.1 1.0 1.0" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ── Dynamic Obstacle Slots (10개) ─────────────────────────────
+         각 슬롯: sphere + box + capsule 3개 geom 사전 할당.
+         reset 시 100개 풀에서 무작위 선택 → 활성 geom만 표시, 나머지 투명.
+         초기 rgba alpha=0 (모두 투명). 크기는 runtime 설정.
+    ─────────────────────────────────────────────────────────────── -->
+    <body name="obs_0" mocap="true" pos="0 0 -100">
+      <geom name="obs_0_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_0_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_0_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_1" mocap="true" pos="0 0 -100">
+      <geom name="obs_1_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_1_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_1_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_2" mocap="true" pos="0 0 -100">
+      <geom name="obs_2_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_2_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_2_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_3" mocap="true" pos="0 0 -100">
+      <geom name="obs_3_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_3_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_3_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_4" mocap="true" pos="0 0 -100">
+      <geom name="obs_4_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_4_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_4_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_5" mocap="true" pos="0 0 -100">
+      <geom name="obs_5_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_5_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_5_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_6" mocap="true" pos="0 0 -100">
+      <geom name="obs_6_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_6_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_6_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_7" mocap="true" pos="0 0 -100">
+      <geom name="obs_7_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_7_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_7_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_8" mocap="true" pos="0 0 -100">
+      <geom name="obs_8_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_8_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_8_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+    <body name="obs_9" mocap="true" pos="0 0 -100">
+      <geom name="obs_9_s" type="sphere"  size="0.05"           rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_9_b" type="box"     size="0.05 0.05 0.05" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+      <geom name="obs_9_c" type="capsule" size="0.04 0.10"      rgba="0 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ── Robot Base ─────────────────────────────────────────────── -->
+    <body name="base_link" pos="0 0 0">
+      <geom name="base_geom" type="mesh" mesh="base_mesh" contype="0" conaffinity="0"/>
+      <geom name="base_col"  type="cylinder" size="0.105 0.225" pos="0 0 0.225"
+            contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+      <body name="link1" pos="0 0 0.1525" quat="1 0 0 0">
+        <joint name="joint1" type="hinge" axis="0 0 1"
+               range="-6.2832 6.2832" damping="5.0" armature="0.4"/>
+        <geom name="link1_geom" type="mesh" mesh="link1_mesh" contype="0" conaffinity="0"/>
+        <geom name="link1_col"  type="cylinder" size="0.09 0.17" pos="0 0 0.12"
+              contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+        <body name="link2" pos="0 0.0345 0" quat="0.5 -0.5 -0.5 -0.5">
+          <joint name="joint2" type="hinge" axis="0 0 1"
+                 range="-6.2832 6.2832" damping="5.0" armature="0.4"/>
+          <geom name="link2_geom0" type="mesh" mesh="link2_mesh0" contype="0" conaffinity="0"/>
+          <geom name="link2_geom1" type="mesh" mesh="link2_mesh1" contype="0" conaffinity="0"/>
+          <geom name="link2_geom2" type="mesh" mesh="link2_mesh2" contype="0" conaffinity="0"/>
+          <geom name="link2_col"   type="capsule" fromto="0.05 0 0 0.57 0 0" size="0.06"
+                contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+          <body name="link3" pos="0.62 0 0" quat="0.7071 0 0 0.7071">
+            <joint name="joint3" type="hinge" axis="0 0 1"
+                   range="-2.7925 2.7925" damping="3.0" armature="0.3"/>
+            <geom name="link3_geom" type="mesh" mesh="link3_mesh" contype="0" conaffinity="0"/>
+            <geom name="link3_col"  type="capsule" fromto="0 -0.05 0 0 -0.51 0" size="0.055"
+                  contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+            <body name="link4" pos="0 -0.559 0" quat="0.7071 0.7071 0 0">
+              <joint name="joint4" type="hinge" axis="0 0 1"
+                     range="-6.2832 6.2832" damping="1.5" armature="0.1"/>
+              <geom name="link4_geom0" type="mesh" mesh="link4_mesh0" contype="0" conaffinity="0"/>
+              <geom name="link4_geom1" type="mesh" mesh="link4_mesh1" contype="0" conaffinity="0"/>
+              <geom name="link4_col"   type="sphere" size="0.06"
+                    contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+              <body name="link5" pos="0 0 0" quat="0.7071 -0.7071 0 0">
+                <joint name="joint5" type="hinge" axis="0 0 1"
+                       range="-6.2832 6.2832" damping="1.5" armature="0.1"/>
+                <geom name="link5_geom" type="mesh" mesh="link5_mesh" contype="0" conaffinity="0"/>
+                <geom name="link5_col"  type="capsule" fromto="0 0 0 0 -0.11 0" size="0.04"
+                      contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+                <body name="link6" pos="0 -0.121 0" quat="0.7071 0.7071 0 0">
+                  <joint name="joint6" type="hinge" axis="0 0 1"
+                         range="-6.2832 6.2832" damping="0.8" armature="0.05"/>
+                  <geom name="link6_geom" type="mesh" mesh="link6_mesh" contype="0" conaffinity="0"/>
+                  <geom name="link6_col"  type="cylinder" size="0.04 0.03"
+                        contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+                  <site name="ee_site" pos="0 0 0" size="0.015" rgba="0.1 0.9 0.1 1"/>
+                  <geom name="ee_marker" type="sphere"  size="0.018"
+                        pos="0 0 0" material="ee_mat" contype="0" conaffinity="0"/>
+                  <geom name="ee_axis_x" type="capsule" fromto="0 0 0 0.06 0 0" size="0.004"
+                        rgba="1.0 0.1 0.1 0.8" contype="0" conaffinity="0"/>
+                  <geom name="ee_axis_y" type="capsule" fromto="0 0 0 0 0.06 0" size="0.004"
+                        rgba="0.1 1.0 0.1 0.8" contype="0" conaffinity="0"/>
+                  <geom name="ee_axis_z" type="capsule" fromto="0 0 0 0 0 0.06" size="0.004"
+                        rgba="0.1 0.1 1.0 0.8" contype="0" conaffinity="0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- Torque actuators: ctrl = normalized torque [-1, 1], gear = max torque (Nm) -->
+  <actuator>
+    <motor name="act1" joint="joint1" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act2" joint="joint2" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act3" joint="joint3" gear="200" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act4" joint="joint4" gear="100" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act5" joint="joint5" gear="100" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act6" joint="joint6" gear="50"  ctrllimited="true" ctrlrange="-1 1"/>
+  </actuator>
+
+</mujoco>

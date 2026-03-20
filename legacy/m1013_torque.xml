@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Doosan Robotics M1013 - MuJoCo MJCF
+  Doosan Robotics M1013 - MuJoCo MJCF (Torque control)
   Kinematic chain from: DoosanRobotics/doosan-robot2 (humble branch)
   Visual meshes: dsr_description2/meshes/m1013_white/
 
@@ -16,7 +16,7 @@
   All joint axes = (0,0,1) in child body frame.
   Body quaternions derived from URDF rpy (extrinsic XYZ = Rz*Ry*Rx).
 -->
-<mujoco model="doosan_m1013">
+<mujoco model="doosan_m1013_torque">
 
   <compiler angle="radian" autolimits="true" meshdir="meshes/m1013_stl"/>
 
@@ -58,14 +58,21 @@
 
     <!-- Target marker (mocap: 물리 영향 없이 위치 직접 지정) -->
     <body name="target" pos="0.5 0.0 1.0" mocap="true">
-      <geom name="target_geom" type="sphere" size="0.035"
+      <geom name="target_geom" type="sphere" size="0.025"
             material="target_mat" contype="0" conaffinity="0"/>
+      <!-- Orientation axes: X=red, Y=green, Z=blue (local body frame) -->
+      <geom name="target_axis_x" type="capsule" fromto="0 0 0 0.08 0 0" size="0.005"
+            rgba="1.0 0.1 0.1 1.0" contype="0" conaffinity="0"/>
+      <geom name="target_axis_y" type="capsule" fromto="0 0 0 0 0.08 0" size="0.005"
+            rgba="0.1 1.0 0.1 1.0" contype="0" conaffinity="0"/>
+      <geom name="target_axis_z" type="capsule" fromto="0 0 0 0 0 0.08" size="0.005"
+            rgba="0.1 0.1 1.0 1.0" contype="0" conaffinity="0"/>
     </body>
 
     <!-- ── Base (URDF: base_link-base fixed joint at z=0.450) ── -->
     <body name="base_link" pos="0 0 0">
       <geom name="base_geom" type="mesh" mesh="base_mesh" contype="0" conaffinity="0"/>
-      <!-- collision geoms disabled (no self-collision needed for RL) -->
+      <!-- collision: simple cylinder -->
       <geom name="base_col" type="cylinder" size="0.105 0.225" pos="0 0 0.225"
             contype="0" conaffinity="0" rgba="0 0 0 0"/>
 
@@ -131,6 +138,13 @@
                   <site name="ee_site" pos="0 0 0" size="0.015" rgba="0.1 0.9 0.1 1"/>
                   <geom name="ee_marker" type="sphere" size="0.018"
                         pos="0 0 0" material="ee_mat" contype="0" conaffinity="0"/>
+                  <!-- EE orientation axes: X=red, Y=green, Z=blue -->
+                  <geom name="ee_axis_x" type="capsule" fromto="0 0 0 0.06 0 0" size="0.004"
+                        rgba="1.0 0.1 0.1 0.8" contype="0" conaffinity="0"/>
+                  <geom name="ee_axis_y" type="capsule" fromto="0 0 0 0 0.06 0" size="0.004"
+                        rgba="0.1 1.0 0.1 0.8" contype="0" conaffinity="0"/>
+                  <geom name="ee_axis_z" type="capsule" fromto="0 0 0 0 0 0.06" size="0.004"
+                        rgba="0.1 0.1 1.0 0.8" contype="0" conaffinity="0"/>
 
                 </body>
               </body>
@@ -141,15 +155,14 @@
     </body>
   </worldbody>
 
-  <!-- Position actuators: ctrl = target angle, PD control internally -->
-  <!-- kp 낮춤 (부드러운 응답), kv 높임 (진동 억제 & 감속) -->
+  <!-- Torque actuators: ctrl = normalized torque [-1, 1], gear = max torque (Nm) -->
   <actuator>
-    <position name="act1" joint="joint1" kp="500"  kv="100" ctrlrange="-6.2832 6.2832"/>
-    <position name="act2" joint="joint2" kp="700"  kv="140" ctrlrange="-6.2832 6.2832"/>
-    <position name="act3" joint="joint3" kp="500"  kv="100" ctrlrange="-2.7925 2.7925"/>
-    <position name="act4" joint="joint4" kp="200"  kv="50"  ctrlrange="-6.2832 6.2832"/>
-    <position name="act5" joint="joint5" kp="200"  kv="50"  ctrlrange="-6.2832 6.2832"/>
-    <position name="act6" joint="joint6" kp="70"   kv="20"  ctrlrange="-6.2832 6.2832"/>
+    <motor name="act1" joint="joint1" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act2" joint="joint2" gear="300" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act3" joint="joint3" gear="200" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act4" joint="joint4" gear="100" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act5" joint="joint5" gear="100" ctrllimited="true" ctrlrange="-1 1"/>
+    <motor name="act6" joint="joint6" gear="50"  ctrllimited="true" ctrlrange="-1 1"/>
   </actuator>
 
 </mujoco>

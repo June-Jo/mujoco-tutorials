@@ -1,40 +1,84 @@
 # M1013 RL Example
 
-두산 로보틱스 M1013 6축 로봇 팔을 MuJoCo로 시뮬레이션하고, PPO로 Reach 태스크를 학습하는 예제입니다.
+두산 로보틱스 M1013 6축 로봇 팔을 MuJoCo로 시뮬레이션하고, **SAC + HER**로 Reach 태스크를 학습하는 예제입니다.
+
+> **Torque 제어 전용.** Position 제어 관련 파일은 `legacy/`로 이동됐습니다.
 
 ## 태스크
 
-엔드이펙터(TCP)를 3D 공간의 랜덤 타겟 위치로 이동시키는 **Reach Task**를 강화학습으로 학습합니다.
+엔드이펙터(TCP)를 3D 공간의 랜덤 타겟 **위치 + 자세**로 이동시키는 Reach Task를 강화학습으로 학습합니다.
 
-- 시작 자세: 6개 관절 전체 범위 내 완전 임의
-- 타겟 위치: FK 기반 전체 workspace 임의 샘플링 (바닥 아래 포함)
+- 시작 자세: 6개 관절 임의 초기화 (커리큘럼에 따라 ±29°→±180° 확장)
+- 타겟: FK 기반 전체 workspace 임의 위치 + 임의 자세 (quaternion)
+- 성공 기준: 위치 오차 < threshold AND 자세 오차 < ori_threshold (커리큘럼 기반 자동 조정)
+- 동적 장애물 회피: 에피소드마다 0~max_obs_count개 장애물이 workspace를 이동
 
 ## 환경
 
-- **시뮬레이터**: MuJoCo 3.x
+- **시뮬레이터**: MuJoCo 3.x (500Hz 물리, 10 sub-steps → 50Hz 제어)
 - **로봇**: Doosan Robotics M1013 (6-DOF, max reach 1.3m)
-- **알고리즘**: PPO (stable-baselines3)
+- **알고리즘**: SAC + HER (Hindsight Experience Replay), stable-baselines3
 - **Python**: 3.12
 
-| 항목 | 내용 |
-|------|------|
-| Observation | 관절각 × 6, 관절속도 × 6, EE 위치 × 3, EE→타겟 벡터 × 3, 거리 × 1 (총 19차원) |
-| Action (position) | 각 관절 Δθ [-1, 1] → [-0.05, 0.05] rad (6차원) |
-| Action (torque) | 각 관절 정규화 토크 [-1, 1] (6차원) |
-| Reward | `(prev_dist - dist) × 10` + 성공 보너스 `+10` - 생존 페널티 `0.01` - 액션 smoothness |
-| 성공 기준 | Curriculum 기반 (초기 30cm, 최소 0.1mm) |
+### Observation Space
+
+GoalEnv Dict 구조:
+
+| 키 | 차원 | 내용 |
+|---|---|---|
+| `observation` | 27D | `qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7) + desired_speed(1)` |
+| `achieved_goal` | 7D | `ee_pos(3) + ee_quat(4)` |
+| `desired_goal` | 7D | `target_pos(3) + target_quat(4)` |
+| `obstacles` | 70D | 10슬롯 × `[cx, cy, cz, p1, p2, p3, type_flag]` |
+
+### Action Space
+
+6개 관절 정규화 토크 `[-1, 1]` (gear 비율 기반 실제 토크 변환)
+
+### Reward
+
+```
+reward = -(pos_dist + 0.3 × angle_error)   # 매 스텝
+       + 10.0                               # 성공 시
+       - 5.0                               # 충돌 시 (에피소드 종료)
+```
+
+## 동적 장애물
+
+100개 형상 풀(구 34 + 박스 33 + 캡슐 33)에서 에피소드마다 최대 10개를 비복원 추출해 배치합니다.
+
+- 장애물은 매 스텝 이동하며, workspace 경계에서 반사
+- 충돌 체크: 로봇 링크 전체(base_link~link6 + EE, 긴 세그먼트 중간점 포함) → 12개 구형 근사 포인트
+- 커리큘럼: 위치 threshold < 10cm 달성 후 장애물 수를 0→10으로 단계적 증가
+
+## 네트워크 구조
+
+```
+ObstacleAwareExtractor
+  robot_net:    (27+7+7=41)D → Linear(256) → ReLU → Linear(256) → ReLU  → 256D
+  obstacle_net: 70D          → Linear(128) → ReLU → Linear(64)  → ReLU  →  64D
+                                                              concat → 320D
+SAC Actor/Critic: 320D → [256, 256, 256]
+```
 
 ## 커리큘럼
 
-성공률에 따라 success threshold를 자동 조정합니다.
+성공률 기준으로 4가지 변수를 자동 조정합니다.
 
 | 조건 | 동작 |
-|------|------|
-| 성공률 ≥ 70% (500 에피소드 기준) | threshold × 0.5 (더 어렵게) |
-| 성공률 < 20% | threshold × 2.0 (더 쉽게, 최대 30cm) |
-| 범위 | 30cm → 0.1mm |
+|---|---|
+| 성공률 ≥ 70% | pos/ori threshold × 0.8, init_range × 1.5 |
+| 성공률 ≥ 70% AND pos_threshold < 10cm | max_obs_count + 1 |
+| 성공률 < 20% | pos/ori threshold × 1.2 |
 
-threshold는 `models/{mode}/success_threshold.txt`에 저장되어 resume 시 복원됩니다.
+| 변수 | 초기값 | 최솟값 |
+|---|---|---|
+| pos_threshold | 30 cm | 0.1 mm |
+| ori_threshold | 45° | 0.1° |
+| init_range | ±29° | → ±180° |
+| max_obs_count | 0 | → 10 |
+
+커리큘럼 상태는 `models/torque/*.txt`에 저장되어 resume 시 자동 복원됩니다.
 
 ## 설치
 
@@ -48,97 +92,83 @@ pip install -e .
 
 ## 사용법
 
-### 로봇 모델 확인
-
-```bash
-# 관절 사인파 모션 확인
-python view.py              # position 제어
-python view.py --torque     # torque 제어
-```
-
 ### 학습
 
 ```bash
-# position 제어 (fresh start)
+# 처음부터
 python train.py --steps 2000000 --envs 8
 
-# torque 제어 (fresh start)
-python train.py --steps 2000000 --envs 8 --torque
-
 # 이어서 학습 (best_model 기준)
-python train.py --steps 2000000 --envs 8 --resume models/position/best_model
-python train.py --steps 2000000 --envs 8 --torque --resume models/torque/best_model
+python train.py --steps 2000000 --envs 8 --resume models/torque/best_model
 ```
 
-학습 로그는 `logs/`, 모델 체크포인트는 `models/`에 저장됩니다.
+학습 로그는 `logs/`, 모델 체크포인트는 `models/torque/`에 저장됩니다.
 
 ```bash
-# TensorBoard로 학습 모니터링
+# TensorBoard 모니터링
 tensorboard --logdir logs
 ```
 
 ### 평가 및 시각화
 
 ```bash
-# position best_model 평가 (텍스트)
+# 텍스트 평가 (저장된 curriculum 상태 자동 복원)
 python evaluate.py
-
-# torque best_model 평가
-python evaluate.py --torque
 
 # MuJoCo 뷰어로 시각화
 python evaluate.py --render
-python evaluate.py --render --torque
 
-# 에피소드 수 지정
-python evaluate.py --render --episodes 10
+# 장애물 수 강제 지정
+python evaluate.py --obstacles 5
+
+# 에피소드 수 / 재생 속도 지정
+python evaluate.py --render --episodes 10 --speed 0.5
 ```
 
 ## 파일 구조
 
 ```
 rl-example/
-├── m1013_position.xml  # Doosan M1013 MuJoCo 모델 (position 제어)
-├── m1013_torque.xml    # Doosan M1013 MuJoCo 모델 (torque 제어)
-├── robot_env.py        # Gymnasium 환경 (M1013Reach-v0, M1013Reach-Torque-v0)
-├── train.py            # PPO 학습 스크립트
-├── evaluate.py         # 평가 및 시각화 스크립트
-├── view.py             # 뷰어 예제 (사인파 모션)
-├── meshes/             # M1013 STL 메시 파일
-│   ├── m1013_stl/           # 비주얼 메시
-│   └── m1013_collision/     # 충돌 메시
-├── models/             # 학습된 모델 저장
-│   ├── position/
-│   │   ├── best_model.zip
-│   │   └── success_threshold.txt
-│   └── torque/
-│       ├── best_model.zip
-│       └── success_threshold.txt
-├── logs/               # TensorBoard 로그
-└── reports/            # 학습 이력 및 분석
-    ├── position.md
-    ├── torque.md
-    └── retrospective.md
+├── m1013.xml              # MuJoCo 씬 (로봇 + 10슬롯×3geom 장애물 + target mocap)
+├── robot_env.py           # Gymnasium GoalEnv (M1013Reach-v0)
+├── train.py               # SAC+HER 학습 스크립트 (ObstacleAwareExtractor 포함)
+├── evaluate.py            # 평가 및 시각화 스크립트
+├── LESSONS_LEARNED.md     # 학습 과정 회고록
+├── meshes/                # M1013 STL/DAE 메시 파일
+├── models/torque/         # 학습된 모델 및 커리큘럼 상태
+│   ├── best_model.zip
+│   ├── vecnormalize.pkl
+│   ├── success_threshold.txt
+│   ├── ori_threshold.txt
+│   ├── init_range.txt
+│   └── max_obs_count.txt
+├── logs/                  # TensorBoard 로그
+└── legacy/                # 구버전 (position 제어, 참조용)
+    ├── m1013_position.xml
+    ├── m1013_torque.xml
+    └── robot_env_position.py
 ```
 
 ## 주요 하이퍼파라미터
 
 | 파라미터 | 값 | 설명 |
-|----------|----|------|
-| `n_steps` | 2048 | rollout 길이 |
+|---|---|---|
+| `learning_rate` | 3e-4 | 학습률 |
+| `buffer_size` | 1,000,000 | Replay buffer 크기 |
 | `batch_size` | 256 | 미니배치 크기 |
-| `n_epochs` | 10 | PPO 업데이트 반복 횟수 |
-| `learning_rate` | 3e-4 | 학습률 (고정) |
-| `ent_coef` | 0.02 | 엔트로피 계수 (탐색 장려) |
-| `gamma` | 0.99 | 할인율 |
-| `gae_lambda` | 0.95 | GAE λ |
-| `net_arch` | [256, 256, 128] | policy/value 네트워크 구조 |
-| `log_std_init` | 0.0 | 초기 액션 표준편차 (std=1.0) |
-| `MAX_DELTA` | 0.05 rad | 스텝당 최대 관절 이동량 (position) |
-| `max_episode_steps` | 500 | 에피소드 최대 길이 |
+| `tau` | 0.005 | Target network soft update 비율 |
+| `gamma` | 0.95 | 할인율 |
+| `target_entropy` | -1.0 | SAC 목표 엔트로피 |
+| `ent_coef` floor | 0.03 | 엔트로피 계수 최솟값 (붕괴 방지) |
+| `n_sampled_goal` | 4 | HER 힌트 goal 수 |
+| `goal_selection_strategy` | future | HER 목표 선택 전략 |
+| `net_arch` | [256, 256, 256] | Actor/Critic 네트워크 구조 |
+| `max_episode_steps` | 200 | 에피소드 최대 길이 (= 4초) |
+| `n_envs` | 8 | 병렬 환경 수 |
 
 ## 참고
 
 - [Doosan Robotics doosan-robot2](https://github.com/DoosanRobotics/doosan-robot2)
 - [MuJoCo Documentation](https://mujoco.readthedocs.io)
 - [Stable-Baselines3](https://stable-baselines3.readthedocs.io)
+- [HER Paper (Andrychowicz et al., 2017)](https://arxiv.org/abs/1707.01495)
