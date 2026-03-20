@@ -49,3 +49,6 @@ Thumbs.db
 # Misc
 .env
 *.log
+
+# Claude
+.claude/
