@@ -60,14 +60,15 @@ def evaluate(model_path: str, n_episodes: int = 20,
                                 M1013Env.INIT_RANGE_INIT)
     max_obs_count = _read_int(os.path.join(model_dir, "max_obs_count.txt"), 0)
 
-    if max_obs_override is not None:
-        max_obs_count = max_obs_override
-
     inner_env = vec_env.venv.envs[0] if isinstance(vec_env, VecNormalize) else vec_env.envs[0]
     unwrapped = _unwrap(inner_env)
     unwrapped.set_success_threshold(threshold, ori_threshold)
     unwrapped.set_init_range(init_range)
-    unwrapped.set_max_obs_count(max_obs_count)
+    if max_obs_override is not None:
+        unwrapped.set_max_obs_count(max_obs_override)
+        unwrapped.fixed_obs_count = max_obs_override  # 정확히 N개 고정
+    else:
+        unwrapped.set_max_obs_count(max_obs_count)
 
     print(f"  pos threshold:  {threshold*100:.2f} cm")
     print(f"  ori threshold:  {np.degrees(ori_threshold):.1f}°")

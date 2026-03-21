@@ -105,6 +105,20 @@ _EE_RADIUS       = 0.04
 # (idx_a, idx_b, n_mid, radius): 긴 세그먼트 중간 샘플링
 # link2(idx=2)→link3(idx=3): 0.62m,  link3(idx=3)→link4(idx=4): 0.559m
 _LONG_SEGMENT_DEFS = [(2, 3, 2, 0.07), (3, 4, 2, 0.06)]
+
+# ── desired_speed 보상 설정 ───────────────────────────────────────────────
+# desired_speed: 사용자 입력 [0.0, 1.0] → observation에 포함
+# meta_speed:    목표 EE 속도 (m/s) = SPEED_META_MIN + desired_speed × (SPEED_META_MAX - SPEED_META_MIN)
+#                [0.1, 0.9] m/s — M1013 최대 선속도(1.0 m/s) 기준, 극단값 회피
+SPEED_META_MIN    = 0.1   # 목표 EE 속도 하한 (m/s)
+SPEED_META_MAX    = 0.9   # 목표 EE 속도 상한 (m/s, M1013 최대 1.0m/s 이하)
+SPEED_WEIGHT_MAX  = 0.2   # 속도 보상 가중치 상한 (커리큘럼으로 0→0.2 증가)
+SPEED_WEIGHT_STEP = 0.05  # 커리큘럼 업데이트 시 증가량
+SPEED_GATE_K      = 2.0   # 거리 게이팅: dist < threshold×K 이하면 속도 보상 감쇠
+SPEED_STEPS_MIN   = 150   # max_episode_steps 하한
+SPEED_STEPS_MAX   = 500   # max_episode_steps 상한
+SPEED_UNLOCK_THRESHOLD = 0.05  # pos_threshold < 5cm 이후 speed reward 커리큘럼 시작
+# 공식: max_episode_steps = clip(100 / meta_speed, 150, 500)   [max_dist=1.0m, CONTROL_DT=0.02]
 # 슬롯별 활성 geom 색상
 _TYPE_RGBA  = {
     'sphere':  np.array([0.85, 0.25, 0.25, 0.75]),
@@ -205,6 +219,7 @@ class M1013Env(gym.Env):
 
         # 장애물 상태
         self.max_obs_count    = 0
+        self.fixed_obs_count  = None   # None=랜덤(0~max), int=고정 수
         self._obs_active      = np.zeros(MAX_OBSTACLES, dtype=bool)
         self._obs_vel         = np.zeros((MAX_OBSTACLES, 3))
         self._obs_params      = [None] * MAX_OBSTACLES   # 슬롯별 현재 size params
@@ -219,7 +234,9 @@ class M1013Env(gym.Env):
         self._target_quat       = np.array([1.0, 0.0, 0.0, 0.0])
 
         # Desired speed (future work)
-        self._desired_speed = 0.0
+        self._desired_speed = 0.5   # [0.0, 1.0]
+        self._meta_speed    = 0.5   # [0.1, 0.9] = 0.1 + desired_speed × 0.8
+        self.speed_weight   = 0.0   # 커리큘럼으로 0 → SPEED_WEIGHT_MAX 증가
 
         # Observation / Action space
         obs_dim = self.n_joints + self.n_joints + 7 + 7 + 1  # 27D
@@ -255,6 +272,9 @@ class M1013Env(gym.Env):
 
     def set_max_obs_count(self, max_obs_count: int):
         self.max_obs_count = int(np.clip(max_obs_count, 0, MAX_OBSTACLES))
+
+    def set_speed_weight(self, weight: float):
+        self.speed_weight = float(np.clip(weight, 0.0, SPEED_WEIGHT_MAX))
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────
 
@@ -295,34 +315,39 @@ class M1013Env(gym.Env):
         dot = float(np.clip(abs(np.dot(q1, q2)), 0.0, 1.0))
         return 2.0 * np.arccos(dot)
 
-    def _sample_target(self) -> np.ndarray:
-        """FK 기반 타겟 위치 샘플링. threshold에 비례해 범위 결정."""
-        saved_qpos  = self.data.qpos.copy()
-        current_ee  = self._get_ee_pos()
-        max_dist    = min(1.0, self.success_threshold * 10)
+    def _sample_target_pose(self) -> tuple:
+        """FK 기반으로 도달 가능한 타겟 위치+자세를 동시에 샘플링.
 
-        target = None
+        같은 관절 설정에서 EE 위치와 자세를 함께 가져오므로
+        반환값은 항상 실제로 도달 가능한 pose임이 보장됨.
+        """
+        saved_qpos   = self.data.qpos.copy()
+        current_pos  = self._get_ee_pos()
+        current_quat = self._get_ee_quat()
+        max_dist     = min(1.0, self.success_threshold * 10)
+
+        result_pos  = None
+        result_quat = None
         for _ in range(50):
             for i, addr in enumerate(self.joint_qpos_addr):
                 self.data.qpos[addr] = np.random.uniform(
                     self.JOINT_RANGES[i, 0], self.JOINT_RANGES[i, 1]
                 )
             mujoco.mj_forward(self.model, self.data)
-            candidate = self._get_ee_pos().copy()
-            if np.linalg.norm(candidate - current_ee) <= max_dist:
-                target = candidate
+            candidate_pos = self._get_ee_pos().copy()
+            if np.linalg.norm(candidate_pos - current_pos) <= max_dist:
+                result_pos  = candidate_pos
+                result_quat = self._get_ee_quat().copy()
                 break
 
-        if target is None:
-            target = self._get_ee_pos().copy()
-
         self.data.qpos[:] = saved_qpos
-        return target
+        mujoco.mj_forward(self.model, self.data)
 
-    def _sample_target_quat(self) -> np.ndarray:
-        q = np.random.randn(4).astype(np.float64)
-        q /= np.linalg.norm(q)
-        return q
+        if result_pos is None:
+            result_pos  = current_pos.copy()
+            result_quat = current_quat.copy()
+
+        return result_pos, result_quat
 
     def _set_target(self, pos: np.ndarray, quat: np.ndarray):
         self._target_pos  = pos.copy()
@@ -348,7 +373,10 @@ class M1013Env(gym.Env):
 
     def _reset_obstacles(self):
         """에피소드 시작 시 100개 풀에서 무작위 샘플링 후 장애물 배치."""
-        n_active = np.random.randint(0, self.max_obs_count + 1)
+        if self.fixed_obs_count is not None:
+            n_active = int(np.clip(self.fixed_obs_count, 0, MAX_OBSTACLES))
+        else:
+            n_active = np.random.randint(0, self.max_obs_count + 1)
         # 100개 풀에서 n_active개 비복원 추출
         sampled_indices = np.random.choice(len(OBSTACLE_POOL), size=n_active, replace=False)
         active_set = set(range(n_active))
@@ -548,6 +576,14 @@ class M1013Env(gym.Env):
         if success:
             reward += 10.0
 
+        # desired_speed 보상: 목표 EE 속도 추종 (목표 근처에서 감쇠)
+        # obs layout: qpos(6)+qvel(6)+ee_pos(3)+ee_quat(4)+ee_vel_lin(3)+ee_vel_qdot(4)+desired_speed(1)
+        if self.speed_weight > 0.0:
+            ee_lin_vel = obs["observation"][19:22]  # ee 선속도 (Jacobian 기반)
+            ee_speed   = float(np.linalg.norm(ee_lin_vel))
+            gate = float(np.clip(dist / (self.success_threshold * SPEED_GATE_K), 0.0, 1.0))
+            reward -= self.speed_weight * gate * (ee_speed - self._meta_speed) ** 2
+
         # 장애물 충돌 체크
         terminated = False
         if self._check_collision(ee_pos):
@@ -570,16 +606,24 @@ class M1013Env(gym.Env):
             ))
         mujoco.mj_forward(self.model, self.data)
 
-        # 타겟 설정
-        target_pos  = self._sample_target()
-        target_quat = self._sample_target_quat()
+        # 타겟 설정 (FK 기반 도달 가능한 위치+자세 동시 샘플링)
+        target_pos, target_quat = self._sample_target_pose()
         self._set_target(target_pos, target_quat)
 
         # 장애물 초기화
         self._reset_obstacles()
 
-        # desired_speed 샘플링 (future work: 보상 미반영)
+        # desired_speed: [0.0, 1.0] 균등 샘플 (사용자 입력 범위, observation에 포함)
         self._desired_speed = float(np.random.uniform(0.0, 1.0))
+
+        # meta_speed: [0.1, 0.9] — 극단값 회피, 속도 보상 및 에피소드 길이 계산에 사용
+        self._meta_speed = SPEED_META_MIN + self._desired_speed * (SPEED_META_MAX - SPEED_META_MIN)
+
+        # max_episode_steps: meta_speed(=목표 EE 속도) 기반 재계산
+        # = 2 × max_dist / (meta_speed × CONTROL_DT) = 100 / meta_speed
+        self.max_episode_steps = int(np.clip(
+            100.0 / self._meta_speed, SPEED_STEPS_MIN, SPEED_STEPS_MAX
+        ))
 
         mujoco.mj_forward(self.model, self.data)
         self._step_count    = 0

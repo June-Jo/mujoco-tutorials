@@ -27,7 +27,9 @@ from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 import robot_env  # M1013Reach-v0 등록
-from robot_env import M1013Env as RobotArmEnv, MAX_OBSTACLES, OBS_UNLOCK_THRESHOLD
+from robot_env import (M1013Env as RobotArmEnv, MAX_OBSTACLES,
+                       OBS_UNLOCK_THRESHOLD, SPEED_UNLOCK_THRESHOLD,
+                       SPEED_WEIGHT_MAX, SPEED_WEIGHT_STEP)
 
 LOG_DIR_BASE   = "./logs"
 MODEL_DIR_BASE = "./models/torque"
@@ -87,23 +89,23 @@ class ObstacleAwareExtractor(BaseFeaturesExtractor):
 class CurriculumCallback(BaseCallback):
     """
     성공률 기반 Curriculum 콜백.
-    pos/ori threshold, init_range, max_obs_count 자동 조정.
+    pos/ori threshold, init_range, max_obs_count, speed_weight 자동 조정.
 
     성공률 >= 70%:
-      - pos/ori threshold × 0.8
-      - init_range × 1.5
-      - pos_threshold < OBS_UNLOCK_THRESHOLD → max_obs_count + 1
+      - pos/ori threshold × 0.8,  init_range × 1.5
+      - pos_threshold < OBS_UNLOCK_THRESHOLD  → max_obs_count + 1
+      - pos_threshold < SPEED_UNLOCK_THRESHOLD → speed_weight += SPEED_WEIGHT_STEP
 
     성공률 < 20%:
-      - pos/ori threshold × 1.2
-      - init_range/max_obs_count 유지
+      - pos/ori threshold × 1.2  (나머지 유지)
     """
 
     def __init__(self, print_freq=500,
                  init_threshold=0.30, init_ori_threshold=None,
-                 init_range=None, init_max_obs_count=0,
+                 init_range=None, init_max_obs_count=0, init_speed_weight=0.0,
                  threshold_save_path=None, ori_threshold_save_path=None,
                  init_range_save_path=None, max_obs_count_save_path=None,
+                 speed_weight_save_path=None,
                  eval_vec_env=None,
                  warmup_episodes=0,
                  verbose=0):
@@ -122,11 +124,13 @@ class CurriculumCallback(BaseCallback):
                                   if init_range is not None
                                   else RobotArmEnv.INIT_RANGE_INIT)
         self.max_obs_count     = int(init_max_obs_count)
+        self.speed_weight      = float(init_speed_weight)
 
         self.threshold_save_path      = threshold_save_path
         self.ori_threshold_save_path  = ori_threshold_save_path
         self.init_range_save_path     = init_range_save_path
         self.max_obs_count_save_path  = max_obs_count_save_path
+        self.speed_weight_save_path   = speed_weight_save_path
         self.eval_vec_env             = eval_vec_env
 
     def _unwrap_envs(self, vec_env):
@@ -140,7 +144,8 @@ class CurriculumCallback(BaseCallback):
         return result
 
     def _set_curriculum(self, threshold: float, ori_threshold: float,
-                        init_range: float = None, max_obs_count: int = None):
+                        init_range: float = None, max_obs_count: int = None,
+                        speed_weight: float = None):
         self.success_threshold = float(np.clip(
             threshold, RobotArmEnv.SUCCESS_THRESHOLD_MIN, RobotArmEnv.SUCCESS_THRESHOLD_MAX,
         ))
@@ -153,6 +158,8 @@ class CurriculumCallback(BaseCallback):
             ))
         if max_obs_count is not None:
             self.max_obs_count = int(np.clip(max_obs_count, 0, MAX_OBSTACLES))
+        if speed_weight is not None:
+            self.speed_weight = float(np.clip(speed_weight, 0.0, SPEED_WEIGHT_MAX))
 
         all_envs = self._unwrap_envs(self.training_env)
         if self.eval_vec_env is not None:
@@ -162,6 +169,7 @@ class CurriculumCallback(BaseCallback):
             env.set_success_threshold(self.success_threshold, self.ori_threshold)
             env.set_init_range(self.init_range)
             env.set_max_obs_count(self.max_obs_count)
+            env.set_speed_weight(self.speed_weight)
 
         if self.threshold_save_path:
             with open(self.threshold_save_path, "w") as f:
@@ -175,6 +183,9 @@ class CurriculumCallback(BaseCallback):
         if self.max_obs_count_save_path:
             with open(self.max_obs_count_save_path, "w") as f:
                 f.write(str(self.max_obs_count))
+        if self.speed_weight_save_path:
+            with open(self.speed_weight_save_path, "w") as f:
+                f.write(str(self.speed_weight))
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -198,16 +209,21 @@ class CurriculumCallback(BaseCallback):
             return True
 
         if rate >= 70.0:
-            new_max_obs = self.max_obs_count
+            new_max_obs    = self.max_obs_count
+            new_speed_w    = self.speed_weight
             if (self.success_threshold <= OBS_UNLOCK_THRESHOLD
                     and self.max_obs_count < MAX_OBSTACLES):
                 new_max_obs = self.max_obs_count + 1
+            if (self.success_threshold <= SPEED_UNLOCK_THRESHOLD
+                    and self.speed_weight < SPEED_WEIGHT_MAX):
+                new_speed_w = self.speed_weight + SPEED_WEIGHT_STEP
 
             self._set_curriculum(
                 self.success_threshold * 0.8,
                 self.ori_threshold * 0.8,
                 init_range=self.init_range * 1.5,
                 max_obs_count=new_max_obs,
+                speed_weight=new_speed_w,
             )
         elif rate < 20.0:
             self._set_curriculum(
@@ -222,6 +238,7 @@ class CurriculumCallback(BaseCallback):
             f"ori: {np.degrees(self.ori_threshold):.1f}° | "
             f"init: ±{np.degrees(self.init_range):.0f}° | "
             f"obs: {self.max_obs_count}/{MAX_OBSTACLES} | "
+            f"spd_w: {self.speed_weight:.2f} | "
             f"ent: {float(self.model.target_entropy):.2f}"
         )
         self._last_logged_ep = self.episodes
@@ -230,6 +247,7 @@ class CurriculumCallback(BaseCallback):
         self.logger.record("train/ori_threshold_deg",   np.degrees(self.ori_threshold))
         self.logger.record("train/init_range_deg",      np.degrees(self.init_range))
         self.logger.record("train/max_obs_count",       self.max_obs_count)
+        self.logger.record("train/speed_weight",        self.speed_weight)
         self.logger.record("train/target_entropy",      float(self.model.target_entropy))
         return True
 
@@ -285,6 +303,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
     ori_threshold_save_path  = os.path.join(model_dir, "ori_threshold.txt")
     init_range_save_path     = os.path.join(model_dir, "init_range.txt")
     max_obs_count_save_path  = os.path.join(model_dir, "max_obs_count.txt")
+    speed_weight_save_path   = os.path.join(model_dir, "speed_weight.txt")
 
     if resume and os.path.exists(vecnorm_path):
         vec_env  = VecNormalize.load(vecnorm_path, vec_env_raw)
@@ -323,6 +342,12 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
         with open(max_obs_count_save_path) as f:
             init_max_obs_count = int(f.read().strip())
         print(f"  max_obs_count 복원: {init_max_obs_count}")
+
+    init_speed_weight = 0.0
+    if resume and os.path.exists(speed_weight_save_path):
+        with open(speed_weight_save_path) as f:
+            init_speed_weight = float(f.read().strip())
+        print(f"  speed_weight 복원: {init_speed_weight:.2f}")
 
     learning_starts = 30_000
 
@@ -379,6 +404,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
             unwrapped.set_success_threshold(init_threshold, init_ori_threshold)
             unwrapped.set_init_range(init_range)
             unwrapped.set_max_obs_count(init_max_obs_count)
+            unwrapped.set_speed_weight(init_speed_weight)
 
     print(f"\n환경 정보:")
     print(f"  Env ID:             M1013Reach-v0")
@@ -405,10 +431,12 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
         init_ori_threshold=init_ori_threshold,
         init_range=init_range,
         init_max_obs_count=init_max_obs_count,
+        init_speed_weight=init_speed_weight,
         threshold_save_path=threshold_save_path,
         ori_threshold_save_path=ori_threshold_save_path,
         init_range_save_path=init_range_save_path,
         max_obs_count_save_path=max_obs_count_save_path,
+        speed_weight_save_path=speed_weight_save_path,
         eval_vec_env=eval_env,
         warmup_episodes=warmup_eps,
         verbose=1,
