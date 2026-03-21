@@ -320,6 +320,7 @@ class M1013Env(gym.Env):
 
         같은 관절 설정에서 EE 위치와 자세를 함께 가져오므로
         반환값은 항상 실제로 도달 가능한 pose임이 보장됨.
+        반환: (pos, quat, goal_qpos) — goal_qpos는 장애물 충돌 가능성 체크에 사용.
         """
         saved_qpos   = self.data.qpos.copy()
         current_pos  = self._get_ee_pos()
@@ -328,16 +329,20 @@ class M1013Env(gym.Env):
 
         result_pos  = None
         result_quat = None
+        result_qpos = None
         for _ in range(50):
+            candidate_qpos = np.array([
+                np.random.uniform(self.JOINT_RANGES[i, 0], self.JOINT_RANGES[i, 1])
+                for i in range(len(self.joint_qpos_addr))
+            ])
             for i, addr in enumerate(self.joint_qpos_addr):
-                self.data.qpos[addr] = np.random.uniform(
-                    self.JOINT_RANGES[i, 0], self.JOINT_RANGES[i, 1]
-                )
+                self.data.qpos[addr] = candidate_qpos[i]
             mujoco.mj_forward(self.model, self.data)
             candidate_pos = self._get_ee_pos().copy()
             if np.linalg.norm(candidate_pos - current_pos) <= max_dist:
                 result_pos  = candidate_pos
                 result_quat = self._get_ee_quat().copy()
+                result_qpos = candidate_qpos.copy()
                 break
 
         self.data.qpos[:] = saved_qpos
@@ -346,8 +351,33 @@ class M1013Env(gym.Env):
         if result_pos is None:
             result_pos  = current_pos.copy()
             result_quat = current_quat.copy()
+            result_qpos = np.array([saved_qpos[addr] for addr in self.joint_qpos_addr])
 
-        return result_pos, result_quat
+        return result_pos, result_quat, result_qpos
+
+    def _is_target_blocked(self) -> bool:
+        """타겟 위치가 활성 장애물과 겹치는지 확인 (EE radius 마진 포함)."""
+        for i in range(MAX_OBSTACLES):
+            if not self._obs_active[i]:
+                continue
+            obs_pos   = self.data.mocap_pos[self._obs_mocap_ids[i]]
+            slot_type = self._obs_active_type[i]
+            params    = self._obs_params[i]
+            if self._dist_point_to_obs(self._target_pos, obs_pos, slot_type, params) < _EE_RADIUS:
+                return True
+        return False
+
+    def _goal_config_collides(self, goal_qpos: np.ndarray) -> bool:
+        """타겟에 도달하는 관절 설정이 현재 장애물 배치와 충돌하는지 확인."""
+        saved_qpos = self.data.qpos.copy()
+        for i, addr in enumerate(self.joint_qpos_addr):
+            self.data.qpos[addr] = goal_qpos[i]
+        mujoco.mj_forward(self.model, self.data)
+        ee_pos = self._get_ee_pos()
+        result = self._check_collision(ee_pos)
+        self.data.qpos[:] = saved_qpos
+        mujoco.mj_forward(self.model, self.data)
+        return result
 
     def _set_target(self, pos: np.ndarray, quat: np.ndarray):
         self._target_pos  = pos.copy()
@@ -606,12 +636,14 @@ class M1013Env(gym.Env):
             ))
         mujoco.mj_forward(self.model, self.data)
 
-        # 타겟 설정 (FK 기반 도달 가능한 위치+자세 동시 샘플링)
-        target_pos, target_quat = self._sample_target_pose()
+        # 타겟 + 장애물 설정: 타겟이 장애물에 막히지 않을 때까지 재시도
+        target_pos, target_quat, goal_qpos = self._sample_target_pose()
         self._set_target(target_pos, target_quat)
-
-        # 장애물 초기화
         self._reset_obstacles()
+        for _ in range(4):  # 최대 5회 시도 (초기 1회 + 재시도 4회)
+            if not self._is_target_blocked() and not self._goal_config_collides(goal_qpos):
+                break
+            self._reset_obstacles()
 
         # desired_speed: [0.0, 1.0] 균등 샘플 (사용자 입력 범위, observation에 포함)
         self._desired_speed = float(np.random.uniform(0.0, 1.0))

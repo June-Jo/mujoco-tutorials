@@ -209,22 +209,32 @@ class CurriculumCallback(BaseCallback):
             return True
 
         if rate >= 70.0:
-            new_max_obs    = self.max_obs_count
-            new_speed_w    = self.speed_weight
-            if (self.success_threshold <= OBS_UNLOCK_THRESHOLD
-                    and self.max_obs_count < MAX_OBSTACLES):
-                new_max_obs = self.max_obs_count + 1
-            if (self.success_threshold <= SPEED_UNLOCK_THRESHOLD
-                    and self.speed_weight < SPEED_WEIGHT_MAX):
-                new_speed_w = self.speed_weight + SPEED_WEIGHT_STEP
+            obs_pending   = (self.success_threshold <= OBS_UNLOCK_THRESHOLD
+                             and self.max_obs_count < MAX_OBSTACLES)
+            speed_pending = (self.success_threshold <= SPEED_UNLOCK_THRESHOLD
+                             and self.speed_weight < SPEED_WEIGHT_MAX)
 
-            self._set_curriculum(
-                self.success_threshold * 0.8,
-                self.ori_threshold * 0.8,
-                init_range=self.init_range * 1.5,
-                max_obs_count=new_max_obs,
-                speed_weight=new_speed_w,
-            )
+            if obs_pending:
+                # obs만 +1, threshold/init_range 유지
+                self._set_curriculum(
+                    self.success_threshold,
+                    self.ori_threshold,
+                    max_obs_count=self.max_obs_count + 1,
+                )
+            elif speed_pending:
+                # speed_weight만 증가, threshold/init_range 유지
+                self._set_curriculum(
+                    self.success_threshold,
+                    self.ori_threshold,
+                    speed_weight=self.speed_weight + SPEED_WEIGHT_STEP,
+                )
+            else:
+                # threshold + init_range만 진행
+                self._set_curriculum(
+                    self.success_threshold * 0.8,
+                    self.ori_threshold * 0.8,
+                    init_range=self.init_range * 1.5,
+                )
         elif rate < 20.0:
             self._set_curriculum(
                 self.success_threshold * 1.2,
@@ -386,7 +396,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
             tau=0.005,
             gamma=0.95,
             ent_coef="auto_0.1",
-            target_entropy=-1.0,
+            target_entropy=-3.0,
             learning_starts=learning_starts,
             policy_kwargs=policy_kwargs,
             tensorboard_log=log_dir,
