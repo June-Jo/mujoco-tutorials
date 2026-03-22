@@ -26,7 +26,7 @@ GoalEnv Dict 구조:
 
 | 키 | 차원 | 내용 |
 |---|---|---|
-| `observation` | 27D | `qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7) + desired_speed(1)` |
+| `observation` | 26D | `qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7)` |
 | `achieved_goal` | 7D | `ee_pos(3) + ee_quat(4)` |
 | `desired_goal` | 7D | `target_pos(3) + target_quat(4)` |
 | `obstacles` | 70D | 10슬롯 × `[cx, cy, cz, p1, p2, p3, type_flag]` |
@@ -38,14 +38,10 @@ GoalEnv Dict 구조:
 ### Reward
 
 ```
-reward = -(pos_dist + 0.3 × angle_error)              # 매 스텝
-       - speed_weight × gate × (ee_speed - meta_speed)²  # 속도 추종 (커리큘럼 활성화 후)
-       + 10.0                                          # 성공 시
-       - 5.0                                           # 충돌 시 (에피소드 종료)
+reward = -(pos_dist + 0.3 × angle_error)  # 매 스텝
+       + 10.0                             # 성공 시
+       - 5.0                              # 충돌 시 (에피소드 종료)
 ```
-
-`desired_speed ∈ [0, 1]` → `meta_speed = 0.1 + desired_speed × 0.8` m/s (목표 EE 속도)
-`gate = clip(dist / (threshold × 2), 0, 1)` — 목표 근처에서 속도 보상 감쇠
 
 ## 동적 장애물
 
@@ -59,7 +55,7 @@ reward = -(pos_dist + 0.3 × angle_error)              # 매 스텝
 
 ```
 ObstacleAwareExtractor
-  robot_net:    (27+7+7=41)D → Linear(256) → ReLU → Linear(256) → ReLU  → 256D
+  robot_net:    (26+7+7=40)D → Linear(256) → ReLU → Linear(256) → ReLU  → 256D
   obstacle_net: 70D          → Linear(128) → ReLU → Linear(64)  → ReLU  →  64D
                                                               concat → 320D
 SAC Actor/Critic: 320D → [256, 256, 256]
@@ -67,13 +63,12 @@ SAC Actor/Critic: 320D → [256, 256, 256]
 
 ## 커리큘럼
 
-성공률 기준으로 5가지 변수를 자동 조정합니다.
+성공률 기준으로 순차적으로 변수를 조정합니다.
 
 | 조건 | 동작 |
 |---|---|
-| 성공률 ≥ 70% | pos/ori threshold × 0.8, init_range × 1.5 |
-| 성공률 ≥ 70% AND pos_threshold < 10cm | max_obs_count + 1 |
-| 성공률 ≥ 70% AND pos_threshold < 5cm | speed_weight += 0.05 |
+| 성공률 ≥ 90% AND pos_threshold < 10cm | max_obs_count + 1 (순차 우선) |
+| 성공률 ≥ 90% AND obs 최대치 | pos/ori threshold × 0.8, init_range × 1.5 |
 | 성공률 < 20% | pos/ori threshold × 1.2 |
 
 | 변수 | 초기값 | 범위 |
@@ -82,7 +77,6 @@ SAC Actor/Critic: 320D → [256, 256, 256]
 | ori_threshold | 45° | → 0.1° |
 | init_range | ±29° | → ±180° |
 | max_obs_count | 0 | → 10 |
-| speed_weight | 0.0 | → 0.2 |
 
 커리큘럼 상태는 `models/torque/*.txt`에 저장되어 resume 시 자동 복원됩니다.
 
@@ -147,8 +141,7 @@ rl-example/
 │   ├── success_threshold.txt
 │   ├── ori_threshold.txt
 │   ├── init_range.txt
-│   ├── max_obs_count.txt
-│   └── speed_weight.txt
+│   └── max_obs_count.txt
 └── logs/                  # TensorBoard 로그
 ```
 
@@ -161,12 +154,12 @@ rl-example/
 | `batch_size` | 256 | 미니배치 크기 |
 | `tau` | 0.005 | Target network soft update 비율 |
 | `gamma` | 0.95 | 할인율 |
-| `target_entropy` | -1.0 | SAC 목표 엔트로피 |
+| `target_entropy` | -3.0 | SAC 목표 엔트로피 |
 | `ent_coef` floor | 0.03 | 엔트로피 계수 최솟값 (붕괴 방지) |
 | `n_sampled_goal` | 4 | HER 힌트 goal 수 |
 | `goal_selection_strategy` | future | HER 목표 선택 전략 |
 | `net_arch` | [256, 256, 256] | Actor/Critic 네트워크 구조 |
-| `max_episode_steps` | clip(100/meta_speed, 150, 500) | desired_speed에 따라 동적 조정 |
+| `max_episode_steps` | 200 | 에피소드 최대 스텝 수 |
 | `n_envs` | 8 | 병렬 환경 수 |
 
 ## 참고

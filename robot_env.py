@@ -3,8 +3,7 @@ Doosan M1013 Robot Arm - Reach + Orientation + Dynamic Obstacle Avoidance
 SAC + HER 환경 (Torque 제어 전용)
 
 Observation (GoalEnv Dict):
-  - observation:    qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7)
-                    + desired_speed(1) = 27D
+  - observation:    qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7) = 26D
   - achieved_goal:  ee_pos(3) + ee_quat(4) = 7D
   - desired_goal:   target_pos(3) + target_quat(4) = 7D
   - obstacles:      10 × [cx, cy, cz, p1, p2, p3, type_flag] = 70D (flat)
@@ -21,10 +20,6 @@ Dynamic obstacles:
   - 에피소드마다 0~max_obs_count개 무작위 활성화
   - 활성 장애물은 매 스텝 이동 (경계 도달 시 반사)
   - 충돌(EE가 장애물 내부 진입) 시 패널티 + 에피소드 종료
-
-desired_speed (Future Work):
-  - [0, 1] 사이 값을 에피소드마다 랜덤 샘플, observation에 포함
-  - 현재는 보상 미반영 — 향후 속도 추적 보상 추가 예정
 """
 
 import numpy as np
@@ -106,19 +101,6 @@ _EE_RADIUS       = 0.04
 # link2(idx=2)→link3(idx=3): 0.62m,  link3(idx=3)→link4(idx=4): 0.559m
 _LONG_SEGMENT_DEFS = [(2, 3, 2, 0.07), (3, 4, 2, 0.06)]
 
-# ── desired_speed 보상 설정 ───────────────────────────────────────────────
-# desired_speed: 사용자 입력 [0.0, 1.0] → observation에 포함
-# meta_speed:    목표 EE 속도 (m/s) = SPEED_META_MIN + desired_speed × (SPEED_META_MAX - SPEED_META_MIN)
-#                [0.1, 0.9] m/s — M1013 최대 선속도(1.0 m/s) 기준, 극단값 회피
-SPEED_META_MIN    = 0.1   # 목표 EE 속도 하한 (m/s)
-SPEED_META_MAX    = 0.9   # 목표 EE 속도 상한 (m/s, M1013 최대 1.0m/s 이하)
-SPEED_WEIGHT_MAX  = 0.2   # 속도 보상 가중치 상한 (커리큘럼으로 0→0.2 증가)
-SPEED_WEIGHT_STEP = 0.05  # 커리큘럼 업데이트 시 증가량
-SPEED_GATE_K      = 2.0   # 거리 게이팅: dist < threshold×K 이하면 속도 보상 감쇠
-SPEED_STEPS_MIN   = 150   # max_episode_steps 하한
-SPEED_STEPS_MAX   = 500   # max_episode_steps 상한
-SPEED_UNLOCK_THRESHOLD = 0.05  # pos_threshold < 5cm 이후 speed reward 커리큘럼 시작
-# 공식: max_episode_steps = clip(100 / meta_speed, 150, 500)   [max_dist=1.0m, CONTROL_DT=0.02]
 # 슬롯별 활성 geom 색상
 _TYPE_RGBA  = {
     'sphere':  np.array([0.85, 0.25, 0.25, 0.75]),
@@ -233,13 +215,8 @@ class M1013Env(gym.Env):
         self._target_pos        = np.zeros(3)
         self._target_quat       = np.array([1.0, 0.0, 0.0, 0.0])
 
-        # Desired speed (future work)
-        self._desired_speed = 0.5   # [0.0, 1.0]
-        self._meta_speed    = 0.5   # [0.1, 0.9] = 0.1 + desired_speed × 0.8
-        self.speed_weight   = 0.0   # 커리큘럼으로 0 → SPEED_WEIGHT_MAX 증가
-
         # Observation / Action space
-        obs_dim = self.n_joints + self.n_joints + 7 + 7 + 1  # 27D
+        obs_dim = self.n_joints + self.n_joints + 7 + 7  # 26D
         self.observation_space = spaces.Dict({
             "observation":   spaces.Box(-np.inf, np.inf, shape=(obs_dim,),                       dtype=np.float32),
             "achieved_goal": spaces.Box(-np.inf, np.inf, shape=(7,),                             dtype=np.float32),
@@ -272,9 +249,6 @@ class M1013Env(gym.Env):
 
     def set_max_obs_count(self, max_obs_count: int):
         self.max_obs_count = int(np.clip(max_obs_count, 0, MAX_OBSTACLES))
-
-    def set_speed_weight(self, weight: float):
-        self.speed_weight = float(np.clip(weight, 0.0, SPEED_WEIGHT_MAX))
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────
 
@@ -557,7 +531,6 @@ class M1013Env(gym.Env):
         ee_vel  = self._get_ee_vel()
         robot_obs = np.concatenate([
             qpos, qvel, ee_pos, ee_quat, ee_vel,
-            [self._desired_speed],
         ]).astype(np.float32)
 
         return {
@@ -636,18 +609,6 @@ class M1013Env(gym.Env):
             if not self._is_target_blocked() and not self._goal_config_collides(goal_qpos):
                 break
             self._reset_obstacles()
-
-        # desired_speed: [0.0, 1.0] 균등 샘플 (사용자 입력 범위, observation에 포함)
-        self._desired_speed = float(np.random.uniform(0.0, 1.0))
-
-        # meta_speed: [0.1, 0.9] — 극단값 회피, 속도 보상 및 에피소드 길이 계산에 사용
-        self._meta_speed = SPEED_META_MIN + self._desired_speed * (SPEED_META_MAX - SPEED_META_MIN)
-
-        # max_episode_steps: meta_speed(=목표 EE 속도) 기반 재계산
-        # = 2 × max_dist / (meta_speed × CONTROL_DT) = 100 / meta_speed
-        self.max_episode_steps = int(np.clip(
-            100.0 / self._meta_speed, SPEED_STEPS_MIN, SPEED_STEPS_MAX
-        ))
 
         mujoco.mj_forward(self.model, self.data)
         self._step_count    = 0
