@@ -606,14 +606,6 @@ class M1013Env(gym.Env):
         if success:
             reward += 10.0
 
-        # desired_speed 보상: 목표 EE 속도 추종 (목표 근처에서 감쇠)
-        # obs layout: qpos(6)+qvel(6)+ee_pos(3)+ee_quat(4)+ee_vel_lin(3)+ee_vel_qdot(4)+desired_speed(1)
-        if self.speed_weight > 0.0:
-            ee_lin_vel = obs["observation"][19:22]  # ee 선속도 (Jacobian 기반)
-            ee_speed   = float(np.linalg.norm(ee_lin_vel))
-            gate = float(np.clip(dist / (self.success_threshold * SPEED_GATE_K), 0.0, 1.0))
-            reward -= self.speed_weight * gate * (ee_speed - self._meta_speed) ** 2
-
         # 장애물 충돌 체크
         terminated = False
         if self._check_collision(ee_pos):

@@ -208,7 +208,7 @@ class CurriculumCallback(BaseCallback):
             self.logger.record("train/success_rate", rate)
             return True
 
-        if rate >= 70.0:
+        if rate >= 90.0:
             obs_pending   = (self.success_threshold <= OBS_UNLOCK_THRESHOLD
                              and self.max_obs_count < MAX_OBSTACLES)
             speed_pending = (self.success_threshold <= SPEED_UNLOCK_THRESHOLD
