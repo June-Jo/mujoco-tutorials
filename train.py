@@ -196,7 +196,7 @@ class CurriculumCallback(BaseCallback):
             self.logger.record("train/success_rate", rate)
             return True
 
-        if rate >= 90.0:
+        if rate >= 85.0:
             obs_pending = (self.success_threshold <= OBS_UNLOCK_THRESHOLD
                            and self.max_obs_count < MAX_OBSTACLES)
 
@@ -362,7 +362,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
             ),
             learning_rate=3e-4,
             buffer_size=1_000_000,
-            batch_size=256,
+            batch_size=512,
             tau=0.005,
             gamma=0.95,
             ent_coef="auto_0.1",

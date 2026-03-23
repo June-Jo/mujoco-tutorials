@@ -19,8 +19,8 @@ env/
 *.mjtb
 
 # Trained models & checkpoints
-models/
-!models/.gitkeep
+#models/
+#!models/.gitkeep
 
 # Training logs
 logs/
@@ -52,3 +52,6 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Legacy
+legacy/

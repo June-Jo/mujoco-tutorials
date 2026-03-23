@@ -67,8 +67,8 @@ SAC Actor/Critic: 320D → [256, 256, 256]
 
 | 조건 | 동작 |
 |---|---|
-| 성공률 ≥ 90% AND pos_threshold < 10cm | max_obs_count + 1 (순차 우선) |
-| 성공률 ≥ 90% AND obs 최대치 | pos/ori threshold × 0.8, init_range × 1.5 |
+| 성공률 ≥ 85% AND pos_threshold < 10cm | max_obs_count + 1 (순차 우선) |
+| 성공률 ≥ 85% AND obs 최대치 | pos/ori threshold × 0.8, init_range × 1.5 |
 | 성공률 < 20% | pos/ori threshold × 1.2 |
 
 | 변수 | 초기값 | 범위 |
@@ -96,10 +96,10 @@ pip install -e .
 
 ```bash
 # 처음부터
-python train.py --steps 100000000 --envs 8
+python train.py --steps 100000000 --envs 16
 
 # 이어서 학습 (best_model 기준)
-python train.py --steps 100000000 --envs 8 --resume models/torque/best_model
+python train.py --steps 100000000 --envs 16 --resume models/torque/best_model
 ```
 
 학습 로그는 `logs/`, 모델 체크포인트는 `models/torque/`에 저장됩니다.
@@ -160,7 +160,7 @@ rl-example/
 | `goal_selection_strategy` | future | HER 목표 선택 전략 |
 | `net_arch` | [256, 256, 256] | Actor/Critic 네트워크 구조 |
 | `max_episode_steps` | 200 | 에피소드 최대 스텝 수 |
-| `n_envs` | 8 | 병렬 환경 수 |
+| `n_envs` | 16 | 병렬 환경 수 |
 
 ## 참고
 
