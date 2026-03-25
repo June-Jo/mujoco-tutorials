@@ -233,11 +233,10 @@ class CurriculumCallback(BaseCallback):
                     self.ori_threshold * 0.8,
                     init_range=self.init_range * 1.5,
                 )
-            # 새 스테이지 진입 — 재탐색 부스트
+            # 새 스테이지 진입 시 정체 카운터 리셋 (부스트 없음)
             if self.ent_floor_callback is not None:
                 self._best_rate = 0.0
                 self._windows_no_improvement = 0
-                self.ent_floor_callback.boost("커리큘럼 전진")
         elif rate < 20.0:
             self._set_curriculum(
                 self.success_threshold * 1.2,
