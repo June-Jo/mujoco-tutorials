@@ -2,7 +2,7 @@
 
 **환경**: Doosan M1013 6-DOF 로봇 팔 Reach Task (위치 + 자세 목표)
 **최종 알고리즘**: SAC + HER (Torque 제어 전용)
-**현재 도달 단계**: pos 4.03cm / ori 6.04° / 장애물 10/10 (v5 fresh start 33M+ 스텝 진행 중)
+**현재 도달 단계**: pos 9.83cm / ori 14.7° / 장애물 0/10 (v6 fresh start ~16M 스텝 진행 중)
 
 ---
 
@@ -429,19 +429,116 @@ obs 0→10 완료까지 약 3.57M 스텝 소요 (초기 단계 중 가장 빠른
 
 ---
 
+## Phase 12 — v5 정체 돌파: v6 아키텍처 전환
+
+### v5 정체 현상
+
+v5 fresh start에서 9.83cm 스테이지 진입 후 약 **20M 스텝** 동안 성공률 50~57%에서 탈출하지 못함.
+
+**분석된 원인**: 네트워크 표현력 부족 + 탐색 부족의 복합.
+- `ent_coef` floor 0.03은 너무 낮아 사실상 결정론적 정책 → 로컬 미니멈 고착
+- `target_entropy=-3.0` + floor 0.03 조합: SAC가 exploit 방향으로 강하게 수렴 후 재탐색 없음
+
+### v6 아키텍처 변경
+
+| 항목 | v5 | v6 |
+|------|----|----|
+| ObstacleAwareExtractor robot_out | 256 | **512** |
+| ObstacleAwareExtractor obstacle_out | 64 | **128** |
+| features_dim | 320 | **640** |
+| net_arch | [256, 256, 256] | **[512, 512, 512]** |
+| target_entropy | -3.0 | **-1.0** (더 높은 탐색 목표) |
+| ent_coef 초기값 | auto_0.1 | **auto_0.2** |
+| ent_coef floor | 0.03 | **0.15** |
+| action_noise | 없음 | **N(0, 0.1)** 추가 |
+| 커리큘럼 advance | 70%→85%→90%→85% 변천 | 85% 유지 |
+
+**결과**: v6에서 30cm → 9.83cm 도달까지 약 **2.5M 스텝** (v5보다 대폭 빠름).
+
+### v6 Resume 시 아키텍처 불일치
+
+네트워크 크기 변경 후 old best_model을 resume하면 텐서 크기 불일치 오류 발생.
+
+**해결**: `SAC.load()`를 try/except로 감싸 실패 시 자동 fresh start:
+```python
+try:
+    model = SAC.load(resume, env=vec_env, ...)
+except Exception as e:
+    print(f"모델 로드 실패: {e}")
+    model = None  # 아래에서 새 모델 생성
+```
+
+---
+
+## Phase 13 — 과탐색 역설과 적응형 ent_coef floor
+
+### 9.83cm 스테이지 재정체
+
+v6에서 빠르게 9.83cm에 도달했지만 이후 **13M+ 스텝** 동안 성공률 59~66% 횡보, 85% 미달.
+
+### 핵심 진단: ent_coef_loss ≈ -8
+
+지속적으로 관찰된 `ent_coef_loss ≈ -8`(크게 음수)은 SAC optimizer가 ent_coef를 **대폭 줄이고 싶다**는 신호.
+현재 정책 엔트로피가 target(-1.0)보다 훨씬 높다 = "SAC 스스로 이제 exploit해야 한다고 판단하는 상태".
+
+그런데 floor 0.15가 이를 막고 있어 **두 가지 탐색 강화가 동시 작동**:
+1. floor 0.15: ent_coef를 강제로 높게 유지
+2. action_noise σ=0.1: 롤아웃에 추가 노이즈
+
+9.83cm 정밀도 달성에는 일관된 fine-grained exploit이 필요한데, 강제 탐색이 오히려 85% 도달을 방해.
+
+### 이전에 이 스테이지가 더 쉬웠던 이유
+
+git 이력 확인 결과, 구 버전의 advance threshold는 **70%**였음.
+현재 성공률(60~66%)은 구 버전이라면 이미 통과 조건 충족.
+즉 네트워크/탐색 설정 문제라기보다는 **더 엄격해진 advance 조건**과 **과탐색의 충돌**이 핵심.
+
+### 해결: 적응형 ent_coef floor
+
+```
+평상시: base_floor = 0.05  ← SAC가 원하면 exploit 가능
+부스트: boost_floor = 0.15 (2,000 에피소드 지속)
+  트리거 1 — 커리큘럼 전진 시: 새 스테이지에서 재탐색 필요
+  트리거 2 — 정체 감지 시: 10 윈도우(= 5,000 에피소드) 연속 성공률 2%p 이상 개선 없으면 자동 부스트
+```
+
+**핵심 아이디어**: exploit으로 수렴해 85% 달성 → 커리큘럼 전진 → 자동 re-explore → 다시 수렴.
+v6에서 고착된 "과탐색으로 인한 정밀도 부족" 문제와, v5에서 겪은 "탐색 부족으로 인한 로컬 미니멈" 문제를 모두 방지.
+
+```python
+# 정체 10 윈도우 → boost
+if self._windows_no_improvement >= self.stagnation_windows:
+    self.ent_floor_callback.boost("정체 감지")
+
+# 커리큘럼 전진 → boost + best_rate 리셋
+if rate >= 85.0:
+    self._set_curriculum(...)
+    self.ent_floor_callback.boost("커리큘럼 전진")
+    self._best_rate = 0.0
+```
+
+### 교훈: 탐색 강화와 수렴 허용은 동시에 달성 불가
+
+- 항상-높은 floor: 수렴 방해 → 정밀도 부족
+- 항상-낮은 floor: 로컬 미니멈 → 탈출 불가
+- **적응형 floor**: "필요할 때만 탐색"이 올바른 접근
+
+---
+
 ## 현재 모델 상태
 
 | 항목 | 값 |
 |------|-----|
 | 알고리즘 | SAC + HER (Torque) |
-| 총 스텝 | 33M+ |
-| pos threshold | 4.03cm |
-| ori threshold | 6.04° |
+| 총 스텝 | ~16M (v6) |
+| pos threshold | 9.83cm |
+| ori threshold | 14.7° |
 | init_range | ±180° |
-| 장애물 | 10/10 |
-| ent_coef | 0.03 (floor 유지) |
-| ep_rew_mean | ~-6 ~ -8 |
-| 성공률 | 63~67% (4.03cm 스테이지 적응 중) |
+| 장애물 | 0/10 |
+| ent_coef floor | 0.05 (base) / 0.15 (boost) 적응형 |
+| target_entropy | -1.0 |
+| action_noise | N(0, 0.1) |
+| net_arch | [512, 512, 512] |
 | n_envs | 16 |
 
 ---
@@ -467,3 +564,9 @@ obs 0→10 완료까지 약 3.57M 스텝 소요 (초기 단계 중 가장 빠른
 9. **advance 조건은 스테이지별 난이도에 맞게 설정**: 90%는 obs 10개 + tight threshold 조합에서 달성 불가 수준. 85%도 6.29cm 스테이지에서 2.74M 스텝 소요. 모델이 구조적 한계에 부딪히면 advance 조건 완화를 고려.
 
 10. **스테이지가 타이트해질수록 소요 스텝이 기하급수적으로 증가**: obs 0→10 구간 ~3.57M, 6.29cm 단일 스테이지 ~2.74M, 5.03cm 스테이지 ~24M 이상 추정. 100M 스텝 기준으로는 2~3cm 수준이 현실적 도달점.
+
+11. **탐색과 수렴은 동시에 달성 불가 — 적응형 조절이 답**: 항상-높은 ent_coef floor는 fine-grained exploit을 방해해 높은 advance threshold(85%)에서 정체를 유발. 항상-낮은 floor는 로컬 미니멈 고착. `ent_coef_loss`가 크게 음수(-8)인데 floor가 이를 막고 있다면 "SAC가 exploit 신호를 보내고 있다"는 의미로 해석하라.
+
+12. **advance threshold와 탐색 설정은 연동해서 고려**: threshold가 올라갈수록 폴리시가 더 일관된 precision이 필요하다. threshold를 높이면서 동시에 강제 탐색도 높이면 두 목표가 서로 충돌한다. 한 번에 하나씩 바꿔야 효과를 추적할 수 있다.
+
+13. **아키텍처 변경 후 resume은 try/except로 보호**: ObstacleAwareExtractor나 net_arch 크기 변경 시 기존 best_model과 텐서 크기가 맞지 않아 로드 실패. 코드 수준에서 실패를 gracefully 처리해 자동 fresh start로 폴백하는 구조가 안전.
