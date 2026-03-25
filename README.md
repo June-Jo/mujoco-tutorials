@@ -55,10 +55,10 @@ reward = -(pos_dist + 0.3 × angle_error)  # 매 스텝
 
 ```
 ObstacleAwareExtractor
-  robot_net:    (26+7+7=40)D → Linear(256) → ReLU → Linear(256) → ReLU  → 256D
-  obstacle_net: 70D          → Linear(128) → ReLU → Linear(64)  → ReLU  →  64D
-                                                              concat → 320D
-SAC Actor/Critic: 320D → [256, 256, 256]
+  robot_net:    (26+7+7=40)D → Linear(512) → ReLU → Linear(512) → ReLU  → 512D
+  obstacle_net: 70D          → Linear(256) → ReLU → Linear(128) → ReLU  → 128D
+                                                              concat → 640D
+SAC Actor/Critic: 640D → [512, 512, 512]
 ```
 
 ## 커리큘럼
@@ -151,16 +151,28 @@ rl-example/
 |---|---|---|
 | `learning_rate` | 3e-4 | 학습률 |
 | `buffer_size` | 1,000,000 | Replay buffer 크기 |
-| `batch_size` | 256 | 미니배치 크기 |
+| `batch_size` | 512 | 미니배치 크기 |
 | `tau` | 0.005 | Target network soft update 비율 |
 | `gamma` | 0.95 | 할인율 |
-| `target_entropy` | -3.0 | SAC 목표 엔트로피 |
-| `ent_coef` floor | 0.03 | 엔트로피 계수 최솟값 (붕괴 방지) |
+| `target_entropy` | -1.0 | SAC 목표 엔트로피 (높은 탐색 목표) |
+| `ent_coef` 초기값 | `auto_0.2` | 엔트로피 계수 초기값 |
+| `ent_coef` floor (평상시) | 0.05 | 평상시 최솟값 — exploit 허용 |
+| `ent_coef` floor (부스트) | 0.15 | 커리큘럼 전진 / 정체 시 일시 상향 |
+| `action_noise` | N(0, 0.1) | 롤아웃 탐색 노이즈 |
 | `n_sampled_goal` | 4 | HER 힌트 goal 수 |
 | `goal_selection_strategy` | future | HER 목표 선택 전략 |
-| `net_arch` | [256, 256, 256] | Actor/Critic 네트워크 구조 |
+| `net_arch` | [512, 512, 512] | Actor/Critic 네트워크 구조 |
 | `max_episode_steps` | 200 | 에피소드 최대 스텝 수 |
 | `n_envs` | 16 | 병렬 환경 수 |
+
+### 적응형 엔트로피 floor
+
+`EntCoefFloorCallback`이 ent_coef 하한을 동적으로 조절합니다.
+
+- **평상시** `base_floor=0.05`: SAC optimizer가 원하는 만큼 exploit 가능
+- **부스트 (2,000 에피소드)** `boost_floor=0.15`: 다음 두 경우에 자동 발동
+  - 커리큘럼 전진 시 — 새로운 어려운 스테이지에서 재탐색
+  - 정체 감지 시 (`stagnation_windows=10`, 성공률 10 윈도우 연속 개선 없음) — 로컬 미니멈 탈출
 
 ## 참고
 

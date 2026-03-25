@@ -22,6 +22,7 @@ from stable_baselines3 import SAC
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
+from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -47,27 +48,27 @@ class ObstacleAwareExtractor(BaseFeaturesExtractor):
     """
 
     def __init__(self, observation_space: spaces.Dict,
-                 robot_out: int = 256, obstacle_out: int = 64):
+                 robot_out: int = 512, obstacle_out: int = 128):
         robot_dim = (
             observation_space["observation"].shape[0]    # 27
             + observation_space["achieved_goal"].shape[0]  # 7
             + observation_space["desired_goal"].shape[0]   # 7
         )  # = 41
         obstacle_dim = observation_space["obstacles"].shape[0]  # 70
-        features_dim = robot_out + obstacle_out  # 320
+        features_dim = robot_out + obstacle_out  # 640
 
         super().__init__(observation_space, features_dim)
 
         self.robot_net = nn.Sequential(
-            nn.Linear(robot_dim, 256),
+            nn.Linear(robot_dim, 512),
             nn.ReLU(),
-            nn.Linear(256, robot_out),
+            nn.Linear(512, robot_out),
             nn.ReLU(),
         )
         self.obstacle_net = nn.Sequential(
-            nn.Linear(obstacle_dim, 128),
+            nn.Linear(obstacle_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, obstacle_out),
+            nn.Linear(256, obstacle_out),
             nn.ReLU(),
         )
 
@@ -105,6 +106,8 @@ class CurriculumCallback(BaseCallback):
                  init_range_save_path=None, max_obs_count_save_path=None,
                  eval_vec_env=None,
                  warmup_episodes=0,
+                 ent_floor_callback=None,
+                 stagnation_windows=10,
                  verbose=0):
         super().__init__(verbose)
         self.successes       = []
@@ -112,6 +115,10 @@ class CurriculumCallback(BaseCallback):
         self._last_logged_ep = 0
         self.print_freq      = print_freq
         self.warmup_episodes = warmup_episodes
+        self.ent_floor_callback       = ent_floor_callback
+        self.stagnation_windows       = stagnation_windows
+        self._best_rate               = 0.0
+        self._windows_no_improvement  = 0
 
         self.success_threshold = init_threshold
         self.ori_threshold     = (init_ori_threshold
@@ -196,6 +203,18 @@ class CurriculumCallback(BaseCallback):
             self.logger.record("train/success_rate", rate)
             return True
 
+        # 정체 감지: 개선이 없으면 카운터 증가, 있으면 리셋
+        if rate > self._best_rate + 2.0:
+            self._best_rate = rate
+            self._windows_no_improvement = 0
+        else:
+            self._windows_no_improvement += 1
+            if (self._windows_no_improvement >= self.stagnation_windows
+                    and self.ent_floor_callback is not None
+                    and not self.ent_floor_callback.is_boosting()):
+                self.ent_floor_callback.boost("정체 감지")
+                self._windows_no_improvement = 0
+
         if rate >= 85.0:
             obs_pending = (self.success_threshold <= OBS_UNLOCK_THRESHOLD
                            and self.max_obs_count < MAX_OBSTACLES)
@@ -214,6 +233,11 @@ class CurriculumCallback(BaseCallback):
                     self.ori_threshold * 0.8,
                     init_range=self.init_range * 1.5,
                 )
+            # 새 스테이지 진입 — 재탐색 부스트
+            if self.ent_floor_callback is not None:
+                self._best_rate = 0.0
+                self._windows_no_improvement = 0
+                self.ent_floor_callback.boost("커리큘럼 전진")
         elif rate < 20.0:
             self._set_curriculum(
                 self.success_threshold * 1.2,
@@ -240,14 +264,44 @@ class CurriculumCallback(BaseCallback):
 
 
 class EntCoefFloorCallback(BaseCallback):
-    """ent_coef가 설정값 아래로 떨어지지 않도록 log_ent_coef를 매 스텝 클램핑."""
+    """적응형 ent_coef floor 콜백.
 
-    def __init__(self, min_ent_coef: float = 0.03, verbose=0):
+    평상시: base_floor (낮음) — SAC가 자유롭게 exploit 가능
+    부스트 중: boost_floor (높음) — 커리큘럼 전진 or 정체 시 일시적 탐색 강화
+
+    boost()를 호출하면 boost_episodes 동안 floor를 높임.
+    """
+
+    def __init__(self, base_floor: float = 0.05, boost_floor: float = 0.15,
+                 boost_episodes: int = 2000, verbose=0):
         super().__init__(verbose)
-        self.min_log_ent_coef = math.log(min_ent_coef)
+        self.base_floor     = base_floor
+        self.boost_floor    = boost_floor
+        self.boost_episodes = boost_episodes
+        self._boost_remaining = 0
+        self._active_floor    = base_floor
+
+    def boost(self, reason: str = ""):
+        """일시적으로 floor를 boost_floor로 올림."""
+        self._boost_remaining = self.boost_episodes
+        self._active_floor    = self.boost_floor
+        print(
+            f"  [EntCoef] floor 부스트 → {self.boost_floor} "
+            f"({self.boost_episodes}ep)"
+            + (f" — {reason}" if reason else "")
+        )
+
+    def is_boosting(self) -> bool:
+        return self._boost_remaining > 0
 
     def _on_step(self) -> bool:
-        self.model.log_ent_coef.data.clamp_(min=self.min_log_ent_coef)
+        for info in self.locals.get("infos", []):
+            if "episode" in info and self._boost_remaining > 0:
+                self._boost_remaining -= 1
+                if self._boost_remaining == 0:
+                    self._active_floor = self.base_floor
+                    print(f"  [EntCoef] 부스트 종료 → floor {self.base_floor}")
+        self.model.log_ent_coef.data.clamp_(min=math.log(self._active_floor))
         return True
 
 
@@ -331,26 +385,41 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
 
     learning_starts = 30_000
 
+    model = None
     if resume and os.path.exists(resume + ".zip"):
         print(f"\n이어서 학습: {resume}")
-        model = SAC.load(resume, env=vec_env, device="cpu", tensorboard_log=log_dir)
-        model.learning_starts = model.num_timesteps + learning_starts
-        print(f"  learning_starts 재설정: {model.learning_starts:,}")
-        from stable_baselines3.common.utils import get_schedule_fn
-        finetune_lr = 3e-4
-        model.learning_rate = finetune_lr
-        model.lr_schedule   = get_schedule_fn(finetune_lr)
-        for opt in [model.policy.actor.optimizer,
-                    model.policy.critic.optimizer,
-                    model.ent_coef_optimizer]:
-            for pg in opt.param_groups:
-                pg["lr"] = finetune_lr
-        print(f"  LR fine-tune: {finetune_lr}")
-    else:
+        try:
+            model = SAC.load(resume, env=vec_env, device="cpu", tensorboard_log=log_dir)
+            # model.learn()이 reset_num_timesteps=True(기본값)로 num_timesteps를 0으로 리셋하므로
+            # model.num_timesteps 기반으로 설정하면 안 됨 → 단순히 learning_starts만 사용
+            model.learning_starts = learning_starts
+            print(f"  learning_starts 재설정: {model.learning_starts:,}")
+            from stable_baselines3.common.utils import get_schedule_fn
+            finetune_lr = 3e-4
+            model.learning_rate = finetune_lr
+            model.lr_schedule   = get_schedule_fn(finetune_lr)
+            for opt in [model.policy.actor.optimizer,
+                        model.policy.critic.optimizer,
+                        model.ent_coef_optimizer]:
+                for pg in opt.param_groups:
+                    pg["lr"] = finetune_lr
+            print(f"  LR fine-tune: {finetune_lr}")
+            # B: target_entropy 업데이트
+            model.target_entropy = -1.0
+            print(f"  target_entropy 재설정: {model.target_entropy}")
+            # C: 액션 노이즈 추가
+            model.action_noise = NormalActionNoise(mean=np.zeros(6), sigma=0.1 * np.ones(6))
+            print(f"  액션 노이즈 추가: N(0, 0.1)")
+        except Exception as e:
+            print(f"  ⚠️  모델 로드 실패 (아키텍처 불일치 등): {e}")
+            print(f"  새 모델로 시작합니다.")
+            model = None
+
+    if model is None:
         policy_kwargs = dict(
             features_extractor_class=ObstacleAwareExtractor,
             features_extractor_kwargs={},
-            net_arch=[256, 256, 256],
+            net_arch=[512, 512, 512],  # 256 → 512 (네트워크 확장)
         )
         model = SAC(
             policy="MultiInputPolicy",
@@ -365,8 +434,12 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
             batch_size=512,
             tau=0.005,
             gamma=0.95,
-            ent_coef="auto_0.1",
-            target_entropy=-3.0,
+            ent_coef="auto_0.2",           # 초기값 상향 (floor 0.15보다 여유)
+            target_entropy=-1.0,           # B: -3.0 → -1.0 (높은 엔트로피 목표)
+            action_noise=NormalActionNoise( # C: 롤아웃 액션 노이즈
+                mean=np.zeros(6),
+                sigma=0.1 * np.ones(6),
+            ),
             learning_starts=learning_starts,
             policy_kwargs=policy_kwargs,
             tensorboard_log=log_dir,
@@ -404,6 +477,8 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
     )
 
     warmup_eps = 2000 if resume else 0
+    ent_floor_callback = EntCoefFloorCallback(base_floor=0.05, boost_floor=0.15,
+                                              boost_episodes=2000)
     curriculum_callback = CurriculumCallback(
         print_freq=500,
         init_threshold=init_threshold,
@@ -416,10 +491,11 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
         max_obs_count_save_path=max_obs_count_save_path,
         eval_vec_env=eval_env,
         warmup_episodes=warmup_eps,
+        ent_floor_callback=ent_floor_callback,
+        stagnation_windows=10,
         verbose=1,
     )
     vecnorm_callback   = VecNormSaveCallback(vecnorm_path, save_freq=10_000)
-    ent_floor_callback = EntCoefFloorCallback(min_ent_coef=0.03)
 
     model.learn(
         total_timesteps=total_timesteps,
