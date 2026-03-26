@@ -554,7 +554,7 @@ class M1013Env(gym.Env):
         q_d = q_d / np.where(norm_d > 1e-8, norm_d, 1.0)
         dot   = np.clip(np.abs(np.sum(q_a * q_d, axis=-1)), 0.0, 1.0)
         angle = 2.0 * np.arccos(dot)
-        return -(pos_dist + 0.3 * angle).astype(np.float32)
+        return -(pos_dist + 1.0 * angle).astype(np.float32)
 
     def _step_reward(self, obs: dict) -> tuple:
         """(reward, success, terminated, dist, angle_err) 반환."""

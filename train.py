@@ -5,7 +5,7 @@ Doosan M1013 - SAC + HER 학습 스크립트 (Torque 제어 전용)
   - Observation: qpos(6) + qvel(6) + ee_pose(7) + ee_vel(7) = 26D
   - Goal: ee_pos(3) + ee_quat(4) = 7D
   - Obstacles: 10 × 7D = 70D (별도 MLP 인코더 처리)
-  - Reward: -(pos_dist + 0.3 × angle) + 성공 보너스(+10) + 충돌 패널티(-5)
+  - Reward: -(pos_dist + 1.0 × angle) + 성공 보너스(+10) + 충돌 패널티(-5)
   - VecNormalize: obs 정규화 ON, reward 정규화 OFF
   - CustomExtractor: ObstacleAwareExtractor (robot MLP + obstacle MLP → concat)
 """
@@ -91,9 +91,12 @@ class CurriculumCallback(BaseCallback):
     성공률 기반 Curriculum 콜백.
     pos/ori threshold, init_range, max_obs_count 자동 조정.
 
-    성공률 >= 90%:
-      - pos_threshold < OBS_UNLOCK_THRESHOLD → max_obs_count + 1
-      - obs가 최대치면 pos/ori threshold × 0.8, init_range × 1.5
+    성공률 >= 85%:
+      - pos / ori / obs / init_range 중 하나를 랜덤 선택해 난이도 상승
+        · pos: success_threshold × 0.8
+        · ori: ori_threshold × 0.8
+        · obs: max_obs_count + 1 (최대치면 선택지에서 제외)
+        · init_range: init_range × 1.5 (최대치면 선택지에서 제외)
 
     성공률 < 20%:
       - pos/ori threshold × 1.2  (나머지 유지)
@@ -211,23 +214,40 @@ class CurriculumCallback(BaseCallback):
             self._windows_no_improvement += 1
 
         if rate >= 85.0:
-            obs_pending = (self.success_threshold <= OBS_UNLOCK_THRESHOLD
-                           and self.max_obs_count < MAX_OBSTACLES)
+            # pos / ori / obs / init_range 중 하나를 랜덤 선택해 난이도 상승
+            options = ["pos", "ori"]
+            if self.max_obs_count < MAX_OBSTACLES:
+                options.append("obs")
+            if self.init_range < RobotArmEnv.INIT_RANGE_MAX:
+                options.append("init_range")
+            choice = np.random.choice(options)
 
-            if obs_pending:
-                # obs만 +1, threshold/init_range 유지
+            if choice == "obs":
                 self._set_curriculum(
                     self.success_threshold,
                     self.ori_threshold,
                     max_obs_count=self.max_obs_count + 1,
                 )
-            else:
-                # threshold + init_range 진행
+                print(f"  [Curriculum] 전진: obs {self.max_obs_count}/{MAX_OBSTACLES}")
+            elif choice == "pos":
                 self._set_curriculum(
                     self.success_threshold * 0.8,
+                    self.ori_threshold,
+                )
+                print(f"  [Curriculum] 전진: pos → {self.success_threshold*100:.2f}cm")
+            elif choice == "ori":
+                self._set_curriculum(
+                    self.success_threshold,
                     self.ori_threshold * 0.8,
+                )
+                print(f"  [Curriculum] 전진: ori → {np.degrees(self.ori_threshold):.2f}°")
+            else:  # init_range
+                self._set_curriculum(
+                    self.success_threshold,
+                    self.ori_threshold,
                     init_range=self.init_range * 1.5,
                 )
+                print(f"  [Curriculum] 전진: init_range → ±{np.degrees(self.init_range):.0f}°")
             # 새 스테이지 진입 시 정체 카운터 리셋 (부스트 없음)
             if self.ent_floor_callback is not None:
                 self._best_rate = 0.0
