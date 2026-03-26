@@ -203,17 +203,12 @@ class CurriculumCallback(BaseCallback):
             self.logger.record("train/success_rate", rate)
             return True
 
-        # 정체 감지: 개선이 없으면 카운터 증가, 있으면 리셋
+        # 정체 감지: 카운터만 유지 (부스트 제거 — ent_coef 상승이 오히려 역효과)
         if rate > self._best_rate + 2.0:
             self._best_rate = rate
             self._windows_no_improvement = 0
         else:
             self._windows_no_improvement += 1
-            if (self._windows_no_improvement >= self.stagnation_windows
-                    and self.ent_floor_callback is not None
-                    and not self.ent_floor_callback.is_boosting()):
-                self.ent_floor_callback.boost("정체 감지")
-                self._windows_no_improvement = 0
 
         if rate >= 85.0:
             obs_pending = (self.success_threshold <= OBS_UNLOCK_THRESHOLD
