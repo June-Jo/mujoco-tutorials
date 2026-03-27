@@ -525,18 +525,131 @@ if rate >= 85.0:
 
 ---
 
+---
+
+## Phase 14 — 커리큘럼 전진 부스트 역효과
+
+### 현상
+
+Phase 13에서 설계한 "커리큘럼 전진 시 boost" 로직이 오히려 성공률 정체를 유발.
+
+**붕괴 패턴**:
+```
+성공률 85% 달성 → 커리큘럼 전진 → boost 발동 (ent_coef 0.15 강제)
+→ 새 스테이지에서 정밀도 부족으로 성공률 급락
+→ 정체 감지 → 부스트 반복
+→ exploit 기회 없이 계속 탐색 → 성공률 50% 고착
+```
+
+**핵심 모순**: advance 직후 새 스테이지는 기존 정책이 "약간만 더 정밀하면 되는" 상태.
+이때 ent_coef를 높이면 정밀도가 떨어져 성공률이 더 낮아짐.
+
+### 해결
+
+커리큘럼 전진 시 boost **제거**. 정체 boost만 유지.
+
+```python
+# 커리큘럼 전진 → boost 없이 카운터 리셋만
+if self.ent_floor_callback is not None:
+    self._best_rate = 0.0
+    self._windows_no_improvement = 0
+```
+
+**교훈**: 커리큘럼 전진 직후는 "새 어려운 문제"가 아니라 "기존 정책 + 약간 더 타이트한 기준"이다.
+재탐색이 아니라 추가 수렴이 필요한 시점.
+
+---
+
+## Phase 15 — 보상 가중치 불균형 (angle weight 0.3 → 1.0)
+
+### 문제
+
+`reward = -(pos_dist + 0.3 × angle_error)` 설계에서 정책이 위치만 최적화하고 자세를 무시.
+
+- 7.84° 스테이지에서 1.5M+ 스텝 정체
+- 성공률 50% 전후 진동 (성공 조건 = 위치 AND 자세 동시 만족)
+- ent_coef, 커리큘럼 조정으로 해결 불가 → 보상 함수 문제로 진단
+
+### 해결
+
+```python
+reward = -(pos_dist + 1.0 × angle_error)  # 0.3 → 1.0
+```
+
+**결과**: 7.84° 스테이지를 ~1.5M 스텝 만에 돌파 (이전 무한 정체).
+
+**교훈**: HER 재라벨링 시 `compute_reward()`도 같은 가중치를 사용하므로, 가중치 불균형은 HER 학습 신호 전체에 영향을 미친다. 자세 정확도가 성공 조건에 포함된다면 보상에서도 동등하게 반영해야 한다.
+
+---
+
+## Phase 16 — 랜덤 단일 축 커리큘럼 전진
+
+### 문제
+
+기존: 성공률 ≥85% 시 pos + ori 동시 ×0.8 + init_range ×1.5 (모든 축 동시 상향).
+
+이 설계의 문제:
+- 전진 한 번에 세 변수가 동시에 어려워짐 → 효과적 난이도 점프가 복합적
+- 어느 변수 때문에 성공률이 떨어졌는지 파악 불가
+- 정책이 한 축은 충분히 학습했는데 다른 축도 동시에 어려워지면 낭비
+
+### 해결
+
+성공률 ≥85% 시 `pos / ori / obs / init_range` 중 **하나를 랜덤 선택**해 난이도 상승:
+
+```python
+options = ["pos", "ori"]
+if self.max_obs_count < MAX_OBSTACLES:
+    options.append("obs")
+if self.init_range < RobotArmEnv.INIT_RANGE_MAX:
+    options.append("init_range")
+choice = np.random.choice(options)
+```
+
+**교훈**: 커리큘럼이 단순할수록 진단이 쉽다. 동시 다변수 조정은 어느 변수가 병목인지 숨긴다.
+
+---
+
+## Phase 17 — 정밀도 구간 ent_coef 재설계
+
+### 문제 (4.18cm / 6.27° / obs 10 스테이지)
+
+base_floor=0.05 유지 상태에서 4.18cm 스테이지 약 900K 스텝 이상 성공률 64~75% 진동.
+
+**진단**:
+- `ent_coef_loss ≈ -4.5` 지속: SAC optimizer가 ent_coef를 더 낮추고 싶어 함
+- floor 0.05가 막고 있어 정밀 제어에 필요한 결정론적 행동이 제한됨
+- `target_entropy=-1.0`: 정책 엔트로피 목표가 너무 높아 precision exploit 방해
+
+**멀티 오브젝티브 충돌**: pos 정밀도 + ori 정밀도 + 장애물 10개 회피 동시 요구 → 그래디언트 간섭.
+
+### 해결
+
+```
+ent_coef floor 제거 (base_floor=0.0): SAC가 원하는 만큼 낮출 수 있도록 허용
+target_entropy -1.0 → -3.0: 더 결정론적인 정책 유도
+정체 boost 복원: N 윈도우 개선 없으면 일시적 탐색 강화로 로컬 미니멈 탈출
+```
+
+**교훈**:
+- `ent_coef_loss`가 지속적으로 음수(-4~-8)이면 SAC가 "이제 exploit이 더 필요하다"는 신호를 보내는 것. floor가 이를 막고 있다면 floor를 낮춰야 한다.
+- precision task에서 `target_entropy`는 더 낮게(-3.0 이하) 설정하는 것이 적절.
+- 단, floor 없이 두면 로컬 미니멈 위험이 있으므로 정체 감지 시 일시 boost는 유지.
+
+---
+
 ## 현재 모델 상태
 
 | 항목 | 값 |
 |------|-----|
 | 알고리즘 | SAC + HER (Torque) |
-| 총 스텝 | ~16M (v6) |
-| pos threshold | 9.83cm |
-| ori threshold | 14.7° |
+| 총 스텝 | ~7.5M (현재 run 기준) |
+| pos threshold | 4.18cm |
+| ori threshold | 6.27° |
 | init_range | ±180° |
-| 장애물 | 0/10 |
-| ent_coef floor | 0.05 (base) / 0.15 (boost) 적응형 |
-| target_entropy | -1.0 |
+| 장애물 | 10/10 |
+| ent_coef floor | 없음 (base_floor=0.0) / boost 0.15 (정체 시) |
+| target_entropy | -3.0 |
 | action_noise | N(0, 0.1) |
 | net_arch | [512, 512, 512] |
 | n_envs | 16 |
@@ -570,3 +683,11 @@ if rate >= 85.0:
 12. **advance threshold와 탐색 설정은 연동해서 고려**: threshold가 올라갈수록 폴리시가 더 일관된 precision이 필요하다. threshold를 높이면서 동시에 강제 탐색도 높이면 두 목표가 서로 충돌한다. 한 번에 하나씩 바꿔야 효과를 추적할 수 있다.
 
 13. **아키텍처 변경 후 resume은 try/except로 보호**: ObstacleAwareExtractor나 net_arch 크기 변경 시 기존 best_model과 텐서 크기가 맞지 않아 로드 실패. 코드 수준에서 실패를 gracefully 처리해 자동 fresh start로 폴백하는 구조가 안전.
+
+14. **커리큘럼 전진 직후 부스트는 역효과**: advance 이후 새 스테이지는 "조금 더 타이트한 기준"이므로 재탐색이 아닌 추가 수렴이 필요. 이때 ent_coef를 강제로 올리면 정밀도가 떨어져 성공률이 더 낮아지는 역설 발생. 정체 감지 시 boost는 유효하지만, advance 트리거 boost는 제거할 것.
+
+15. **보상 가중치 불균형은 HER 전체를 오염시킨다**: HER 재라벨링 시 `compute_reward()`로 보상을 재계산하므로, 가중치 불균형이 있으면 재라벨된 경험 전체에 왜곡된 학습 신호가 전달된다. 자세 오차가 성공 조건에 포함되어 있다면 보상에서도 동등한 비중을 줘야 한다 (angle weight 0.3 → 1.0).
+
+16. **다변수 커리큘럼 동시 전진은 병목 파악을 어렵게 한다**: pos/ori/obs를 동시에 어렵게 만들면 어느 변수 때문에 성공률이 하락했는지 알 수 없다. 랜덤 단일 축 전진으로 변경하면 각 스테이지의 병목 변수를 관찰할 수 있다.
+
+17. **precision 구간에서 target_entropy는 낮게**: 정밀도 요구가 높아질수록 SAC는 더 결정론적인 정책을 필요로 한다. `ent_coef_loss`가 지속적으로 음수면 target_entropy를 낮추고(-3.0 이하) floor를 제거해 SAC가 원하는 만큼 결정론적으로 행동하게 하라. 단, 정체 감지 시 일시적 boost는 로컬 미니멈 탈출용으로 유지.

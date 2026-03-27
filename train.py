@@ -206,12 +206,19 @@ class CurriculumCallback(BaseCallback):
             self.logger.record("train/success_rate", rate)
             return True
 
-        # 정체 감지: 카운터만 유지 (부스트 제거 — ent_coef 상승이 오히려 역효과)
+        # 정체 감지
         if rate > self._best_rate + 2.0:
             self._best_rate = rate
             self._windows_no_improvement = 0
         else:
             self._windows_no_improvement += 1
+
+        # 정체 시 탐색 부스트 (성공률 개선 없이 N 윈도우 경과)
+        if (self._windows_no_improvement >= self.stagnation_windows
+                and self.ent_floor_callback is not None
+                and not self.ent_floor_callback.is_boosting()):
+            self.ent_floor_callback.boost(reason="정체 감지")
+            self._windows_no_improvement = 0
 
         if rate >= 85.0:
             # pos / ori / obs / init_range 중 하나를 랜덤 선택해 난이도 상승
@@ -286,7 +293,7 @@ class EntCoefFloorCallback(BaseCallback):
     boost()를 호출하면 boost_episodes 동안 floor를 높임.
     """
 
-    def __init__(self, base_floor: float = 0.05, boost_floor: float = 0.15,
+    def __init__(self, base_floor: float = 0.0, boost_floor: float = 0.15,
                  boost_episodes: int = 2000, verbose=0):
         super().__init__(verbose)
         self.base_floor     = base_floor
@@ -314,8 +321,10 @@ class EntCoefFloorCallback(BaseCallback):
                 self._boost_remaining -= 1
                 if self._boost_remaining == 0:
                     self._active_floor = self.base_floor
-                    print(f"  [EntCoef] 부스트 종료 → floor {self.base_floor}")
-        self.model.log_ent_coef.data.clamp_(min=math.log(self._active_floor))
+                    label = f"{self.base_floor}" if self.base_floor > 0 else "없음"
+                    print(f"  [EntCoef] 부스트 종료 → floor {label}")
+        if self._active_floor > 0:
+            self.model.log_ent_coef.data.clamp_(min=math.log(self._active_floor))
         return True
 
 
@@ -419,7 +428,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
                     pg["lr"] = finetune_lr
             print(f"  LR fine-tune: {finetune_lr}")
             # B: target_entropy 업데이트
-            model.target_entropy = -1.0
+            model.target_entropy = -3.0
             print(f"  target_entropy 재설정: {model.target_entropy}")
             # C: 액션 노이즈 추가
             model.action_noise = NormalActionNoise(mean=np.zeros(6), sigma=0.1 * np.ones(6))
@@ -449,7 +458,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
             tau=0.005,
             gamma=0.95,
             ent_coef="auto_0.2",           # 초기값 상향 (floor 0.15보다 여유)
-            target_entropy=-1.0,           # B: -3.0 → -1.0 (높은 엔트로피 목표)
+            target_entropy=-3.0,           # 더 결정론적인 정책 목표
             action_noise=NormalActionNoise( # C: 롤아웃 액션 노이즈
                 mean=np.zeros(6),
                 sigma=0.1 * np.ones(6),
@@ -491,7 +500,7 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
     )
 
     warmup_eps = 2000 if resume else 0
-    ent_floor_callback = EntCoefFloorCallback(base_floor=0.05, boost_floor=0.15,
+    ent_floor_callback = EntCoefFloorCallback(base_floor=0.0, boost_floor=0.15,
                                               boost_episodes=2000)
     curriculum_callback = CurriculumCallback(
         print_freq=500,

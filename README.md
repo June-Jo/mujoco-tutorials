@@ -38,7 +38,7 @@ GoalEnv Dict 구조:
 ### Reward
 
 ```
-reward = -(pos_dist + 0.3 × angle_error)  # 매 스텝
+reward = -(pos_dist + 1.0 × angle_error)  # 매 스텝
        + 10.0                             # 성공 시
        - 5.0                              # 충돌 시 (에피소드 종료)
 ```
@@ -63,13 +63,18 @@ SAC Actor/Critic: 640D → [512, 512, 512]
 
 ## 커리큘럼
 
-성공률 기준으로 순차적으로 변수를 조정합니다.
+성공률 기준으로 자동 조정합니다.
 
 | 조건 | 동작 |
 |---|---|
-| 성공률 ≥ 85% AND pos_threshold < 10cm | max_obs_count + 1 (순차 우선) |
-| 성공률 ≥ 85% AND obs 최대치 | pos/ori threshold × 0.8, init_range × 1.5 |
+| 성공률 ≥ 85% | pos / ori / obs / init_range 중 **하나를 랜덤 선택**해 난이도 상승 |
 | 성공률 < 20% | pos/ori threshold × 1.2 |
+
+각 축의 전진 규칙:
+- `pos`: success_threshold × 0.8
+- `ori`: ori_threshold × 0.8
+- `obs`: max_obs_count + 1 (최대치면 후보 제외)
+- `init_range`: init_range × 1.5 (최대치면 후보 제외)
 
 | 변수 | 초기값 | 범위 |
 |---|---|---|
@@ -154,10 +159,10 @@ rl-example/
 | `batch_size` | 512 | 미니배치 크기 |
 | `tau` | 0.005 | Target network soft update 비율 |
 | `gamma` | 0.95 | 할인율 |
-| `target_entropy` | -1.0 | SAC 목표 엔트로피 (높은 탐색 목표) |
+| `target_entropy` | -3.0 | SAC 목표 엔트로피 (결정론적 정책 유도) |
 | `ent_coef` 초기값 | `auto_0.2` | 엔트로피 계수 초기값 |
-| `ent_coef` floor (평상시) | 0.05 | 평상시 최솟값 — exploit 허용 |
-| `ent_coef` floor (부스트) | 0.15 | 커리큘럼 전진 / 정체 시 일시 상향 |
+| `ent_coef` floor (평상시) | 없음 | SAC optimizer가 자유롭게 낮출 수 있음 |
+| `ent_coef` floor (부스트) | 0.15 | 정체 감지 시 일시 상향 (2,000 에피소드) |
 | `action_noise` | N(0, 0.1) | 롤아웃 탐색 노이즈 |
 | `n_sampled_goal` | 4 | HER 힌트 goal 수 |
 | `goal_selection_strategy` | future | HER 목표 선택 전략 |
@@ -165,14 +170,13 @@ rl-example/
 | `max_episode_steps` | 200 | 에피소드 최대 스텝 수 |
 | `n_envs` | 16 | 병렬 환경 수 |
 
-### 적응형 엔트로피 floor
+### 적응형 엔트로피 제어
 
 `EntCoefFloorCallback`이 ent_coef 하한을 동적으로 조절합니다.
 
-- **평상시** `base_floor=0.05`: SAC optimizer가 원하는 만큼 exploit 가능
-- **부스트 (2,000 에피소드)** `boost_floor=0.15`: 다음 두 경우에 자동 발동
-  - 커리큘럼 전진 시 — 새로운 어려운 스테이지에서 재탐색
-  - 정체 감지 시 (`stagnation_windows=10`, 성공률 10 윈도우 연속 개선 없음) — 로컬 미니멈 탈출
+- **평상시 floor 없음**: SAC optimizer가 `target_entropy=-3.0`을 향해 ent_coef를 자유롭게 낮춤 — 정밀 제어 구간에서 결정론적 exploit 허용
+- **부스트 (2,000 에피소드)** `boost_floor=0.15`: 정체 감지 시 자동 발동
+  - 정체 감지 (`stagnation_windows=10`, 성공률 10 윈도우 연속 개선 없음) — 로컬 미니멈 탈출
 
 ## 참고
 
