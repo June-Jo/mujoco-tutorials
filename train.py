@@ -1,11 +1,11 @@
 """
-Doosan M1013 - SAC + HER 학습 스크립트 (Torque 제어 전용)
+Doosan M1013 - SAC 학습 스크립트 (Torque 제어 전용)
 
 설계:
   - Observation: qpos(6) + qvel(6) + ee_pose(7) + ee_vel(7) = 26D
   - Goal: ee_pos(3) + ee_quat(4) = 7D
   - Obstacles: 10 × 7D = 70D (별도 MLP 인코더 처리)
-  - Reward: -(pos_dist + 1.0 × angle) + 성공 보너스(+10) + 충돌 패널티(-5)
+  - Reward: -(dist + angle) + progress + proximity×exp(-vel×5) + 성공(+10) + 충돌(-5)
   - VecNormalize: obs 정규화 ON, reward 정규화 OFF
   - CustomExtractor: ObstacleAwareExtractor (robot MLP + obstacle MLP → concat)
 """
@@ -19,7 +19,6 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from stable_baselines3 import SAC
-from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
 from stable_baselines3.common.noise import NormalActionNoise
@@ -447,11 +446,6 @@ def train(total_timesteps: int = 2_000_000, n_envs: int = 8, resume: str = None)
         model = SAC(
             policy="MultiInputPolicy",
             env=vec_env,
-            replay_buffer_class=HerReplayBuffer,
-            replay_buffer_kwargs=dict(
-                n_sampled_goal=4,
-                goal_selection_strategy="future",
-            ),
             learning_rate=3e-4,
             buffer_size=1_000_000,
             batch_size=512,
