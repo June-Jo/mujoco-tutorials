@@ -1,25 +1,15 @@
 """
-Doosan M1013 Robot Arm - Reach + Orientation + Dynamic Obstacle Avoidance
-SAC + HER 환경 (Torque 제어 전용)
+Doosan M1013 Robot Arm - Reach + Orientation
+SAC 환경 (Torque 제어 전용)
 
-Observation (GoalEnv Dict):
-  - observation:    qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7) = 26D
-  - achieved_goal:  ee_pos(3) + ee_quat(4) = 7D
-  - desired_goal:   target_pos(3) + target_quat(4) = 7D
-  - obstacles:      10 × [cx, cy, cz, p1, p2, p3, type_flag] = 70D (flat)
-                    type_flag: 0=sphere, 1=box, 2=capsule, -1=inactive
+Observation (flat Box, 33D):
+  qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7)
+  + target_pos(3) + target_quat(4)
 
-Curriculum (4 variables):
+Curriculum (3 variables):
   - pos_threshold:  30cm → 0.1mm
   - ori_threshold:  45° → 0.1°
   - init_range:     ±29° → ±180°
-  - max_obs_count:  0 → 10  (pos_threshold < 10cm 이후 활성화)
-
-Dynamic obstacles:
-  - 100개 풀 (구 34 + 박스 33 + 캡슐 33)
-  - 에피소드마다 0~max_obs_count개 무작위 활성화
-  - 활성 장애물은 매 스텝 이동 (경계 도달 시 반사)
-  - 충돌(EE가 장애물 내부 진입) 시 패널티 + 에피소드 종료
 """
 
 import numpy as np
@@ -29,97 +19,33 @@ import mujoco
 import os
 
 
-# ── 장애물 설정 ───────────────────────────────────────────────────────────
+# 자가충돌 체크용 로봇 링크 바디명
+_ROBOT_BODY_NAMES = ["base_link", "link1", "link2", "link3", "link4", "link5", "link6"]
 
-MAX_OBSTACLES   = 10
-OBS_FEAT_DIM    = 7      # 슬롯당 피처: [cx, cy, cz, p1, p2, p3, type_flag]
-CONTROL_DT      = 0.002 * 10  # 0.02s per control step (10 sub-steps)
+# 인접 링크 쌍 (조인트로 연결 — 항상 접촉 가능하므로 자가충돌에서 제외)
+_ADJACENT_BODY_PAIRS = [
+    ("base_link", "link1"),
+    ("link1",     "link2"),
+    ("link2",     "link3"),
+    ("link3",     "link4"),
+    ("link4",     "link5"),
+    ("link5",     "link6"),
+]
 
-OBS_UNLOCK_THRESHOLD = 0.10   # pos_threshold < 10cm 이후 장애물 커리큘럼 시작
-OBS_WS_LOW  = np.array([-0.90, -0.90, 0.15])   # 장애물 활성화 workspace
-OBS_WS_HIGH = np.array([ 0.90,  0.90, 1.40])
-OBS_MIN_SPEED = 0.05   # m/s
-OBS_MAX_SPEED = 0.25   # m/s
-COLLISION_PENALTY = 5.0
-PARK_POS = np.array([0.0, 0.0, -2.0])  # 비활성 장애물 주차 위치
-
-# 장애물 풀 (100개 형상)
-
-# Sphere: radius (34개, meters)
-SPHERE_POOL = np.array([
-    0.030, 0.035, 0.040, 0.045, 0.050, 0.055, 0.060, 0.065, 0.070, 0.075,
-    0.080, 0.085, 0.090, 0.095, 0.100, 0.110, 0.120, 0.130, 0.140, 0.150,
-    0.160, 0.170, 0.180, 0.190, 0.200, 0.220, 0.250, 0.048, 0.058, 0.068,
-    0.078, 0.088, 0.098, 0.108,
-])  # 34개
-
-# Box: half-sizes [hx, hy, hz] (33개)
-BOX_POOL = np.array([
-    [0.040, 0.040, 0.040], [0.080, 0.040, 0.040], [0.040, 0.080, 0.040],
-    [0.040, 0.040, 0.080], [0.080, 0.080, 0.040], [0.080, 0.040, 0.080],
-    [0.040, 0.080, 0.080], [0.080, 0.080, 0.080], [0.120, 0.040, 0.040],
-    [0.040, 0.120, 0.040], [0.040, 0.040, 0.120], [0.120, 0.080, 0.040],
-    [0.120, 0.040, 0.080], [0.080, 0.120, 0.040], [0.040, 0.120, 0.080],
-    [0.080, 0.040, 0.120], [0.040, 0.080, 0.120], [0.120, 0.120, 0.040],
-    [0.120, 0.040, 0.120], [0.040, 0.120, 0.120], [0.120, 0.120, 0.080],
-    [0.120, 0.080, 0.120], [0.080, 0.120, 0.120], [0.120, 0.120, 0.120],
-    [0.160, 0.040, 0.040], [0.040, 0.160, 0.040], [0.040, 0.040, 0.160],
-    [0.160, 0.080, 0.040], [0.160, 0.040, 0.080], [0.080, 0.160, 0.040],
-    [0.040, 0.160, 0.080], [0.080, 0.040, 0.160], [0.040, 0.080, 0.160],
-])  # 33개
-
-# Capsule: [radius, half_cyl_length] (33개)
-# MuJoCo capsule size: size[0]=radius, size[1]=half cylinder length (not including caps)
-CAPSULE_POOL = np.array([
-    [0.030, 0.100], [0.030, 0.150], [0.030, 0.200],
-    [0.040, 0.100], [0.040, 0.150], [0.040, 0.200], [0.040, 0.250],
-    [0.050, 0.100], [0.050, 0.150], [0.050, 0.200], [0.050, 0.250], [0.050, 0.300],
-    [0.060, 0.100], [0.060, 0.150], [0.060, 0.200], [0.060, 0.250], [0.060, 0.300],
-    [0.070, 0.150], [0.070, 0.200], [0.070, 0.250], [0.070, 0.300],
-    [0.080, 0.150], [0.080, 0.200], [0.080, 0.250], [0.080, 0.300],
-    [0.090, 0.200], [0.090, 0.250], [0.090, 0.300],
-    [0.100, 0.200], [0.100, 0.250], [0.100, 0.300], [0.100, 0.350], [0.100, 0.400],
-])  # 33개
-
-# 100개 통합 장애물 풀 (자유롭게 슬롯에 배정 가능)
-OBSTACLE_POOL = (
-    [('sphere',  np.array([r]))     for r in SPHERE_POOL] +   # 34개
-    [('box',     p.copy())          for p in BOX_POOL]    +   # 33개
-    [('capsule', p.copy())          for p in CAPSULE_POOL]    # 33개
-)  # 합계 100개
-
-_TYPE_FLAG  = {'sphere': 0.0, 'box': 1.0, 'capsule': 2.0}
-
-# ── 로봇 링크 충돌 체크 설정 ─────────────────────────────────────────────
-
-# 링크 body 이름 및 보수적 반경 (m) — 실제 geom보다 약간 크게 설정
-_LINK_BODY_NAMES = ["base_link", "link1", "link2", "link3", "link4", "link5", "link6"]
-_LINK_RADII      = [      0.09,     0.08,    0.07,    0.07,    0.06,    0.05,    0.04]
-_EE_RADIUS       = 0.04
-
-# (idx_a, idx_b, n_mid, radius): 긴 세그먼트 중간 샘플링
-# link2(idx=2)→link3(idx=3): 0.62m,  link3(idx=3)→link4(idx=4): 0.559m
-_LONG_SEGMENT_DEFS = [(2, 3, 2, 0.07), (3, 4, 2, 0.06)]
-
-# 슬롯별 활성 geom 색상
-_TYPE_RGBA  = {
-    'sphere':  np.array([0.85, 0.25, 0.25, 0.75]),
-    'box':     np.array([0.25, 0.75, 0.30, 0.75]),
-    'capsule': np.array([0.25, 0.45, 0.90, 0.75]),
-}
+SELF_COLLISION_PENALTY = 5.0
 
 
 # ── 환경 클래스 ───────────────────────────────────────────────────────────
 
 class M1013Env(gym.Env):
     """
-    Doosan M1013 6-DOF 로봇 팔 Reach+Orientation+장애물 회피 환경 (SAC + HER).
+    Doosan M1013 6-DOF 로봇 팔 Reach+Orientation 환경 (SAC).
 
-    GoalEnv 스타일 Dict Observation:
-      observation(27D) + achieved_goal(7D) + desired_goal(7D) + obstacles(70D)
+    Observation: flat 33D Box
+      qpos(6) + qvel(6) + ee_pos(3) + ee_quat(4) + ee_vel(7)
+      + target_pos(3) + target_quat(4)
 
-    Curriculum:
-      pos/ori threshold + init_range + max_obs_count 자동 조정
+    Curriculum: pos/ori threshold + init_range 자동 조정
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
@@ -148,11 +74,14 @@ class M1013Env(gym.Env):
     SUCCESS_HOLD_STEPS = 5
     XML_FILE = "m1013.xml"
 
+    # flat obs 구성: [qpos(6), qvel(6), ee_pos(3), ee_quat(4), ee_vel(7), target_pos(3), target_quat(4)]
+    OBS_DIM = 6 + 6 + 3 + 4 + 7 + 3 + 4  # = 33
+
     def __init__(self, render_mode=None, max_episode_steps=200):
         super().__init__()
-        self.render_mode      = render_mode
+        self.render_mode       = render_mode
         self.max_episode_steps = max_episode_steps
-        self._step_count      = 0
+        self._step_count       = 0
 
         xml_path = os.path.join(os.path.dirname(__file__), self.XML_FILE)
         self.model = mujoco.MjModel.from_xml_path(xml_path)
@@ -176,53 +105,34 @@ class M1013Env(gym.Env):
         target_bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "target")
         self.target_mocap_idx = self.model.body_mocapid[target_bid]
 
-        # 로봇 링크 body IDs (충돌 체크용)
-        self._link_body_ids = [
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
-            for name in _LINK_BODY_NAMES
-        ]
-        # 긴 세그먼트 중간점 체크: (body_id_a, body_id_b, n_mid, radius)
-        self._link_segment_checks = [
-            (self._link_body_ids[a], self._link_body_ids[b], n, r)
-            for a, b, n, r in _LONG_SEGMENT_DEFS
-        ]
+        # 자가충돌 체크: 로봇 body ID 집합 + 제외할 인접 쌍
+        self._robot_body_ids = set()
+        for name in _ROBOT_BODY_NAMES:
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if bid >= 0:
+                self._robot_body_ids.add(bid)
 
-        # Obstacle mocap / geom IDs (슬롯 0~9, 각 슬롯에 sphere/box/capsule 3개 geom)
-        self._obs_mocap_ids   = []
-        self._obs_geom_ids    = []  # list of dict: {'sphere': gid, 'box': gid, 'capsule': gid}
-        for i in range(MAX_OBSTACLES):
-            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obs_{i}")
-            self._obs_mocap_ids.append(int(self.model.body_mocapid[bid]))
-            self._obs_geom_ids.append({
-                'sphere':  int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"obs_{i}_s")),
-                'box':     int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"obs_{i}_b")),
-                'capsule': int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"obs_{i}_c")),
-            })
-
-        # 장애물 상태
-        self.max_obs_count    = 0
-        self.fixed_obs_count  = None   # None=랜덤(0~max), int=고정 수
-        self._obs_active      = np.zeros(MAX_OBSTACLES, dtype=bool)
-        self._obs_vel         = np.zeros((MAX_OBSTACLES, 3))
-        self._obs_params      = [None] * MAX_OBSTACLES   # 슬롯별 현재 size params
-        self._obs_active_type = [None] * MAX_OBSTACLES   # 슬롯별 현재 활성 타입 str
+        self._adjacent_body_pairs = set()
+        for n1, n2 in _ADJACENT_BODY_PAIRS:
+            b1 = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n1)
+            b2 = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n2)
+            if b1 >= 0 and b2 >= 0:
+                self._adjacent_body_pairs.add((min(b1, b2), max(b1, b2)))
 
         # Curriculum 상태
-        self.success_threshold  = self.SUCCESS_THRESHOLD_INIT
-        self.ori_threshold      = self.ORI_THRESHOLD_INIT
-        self._init_qpos_range   = self.INIT_RANGE_INIT
-        self._success_steps     = 0
-        self._target_pos        = np.zeros(3)
-        self._target_quat       = np.array([1.0, 0.0, 0.0, 0.0])
+        self.success_threshold = self.SUCCESS_THRESHOLD_INIT
+        self.ori_threshold     = self.ORI_THRESHOLD_INIT
+        self._init_qpos_range  = self.INIT_RANGE_INIT
+        self._success_steps    = 0
+        self._target_pos       = np.zeros(3)
+        self._target_quat      = np.array([1.0, 0.0, 0.0, 0.0])
+        self._prev_dist        = 0.0
+        self._prev_angle_err   = 0.0
 
         # Observation / Action space
-        obs_dim = self.n_joints + self.n_joints + 7 + 7  # 26D
-        self.observation_space = spaces.Dict({
-            "observation":   spaces.Box(-np.inf, np.inf, shape=(obs_dim,),                       dtype=np.float32),
-            "achieved_goal": spaces.Box(-np.inf, np.inf, shape=(7,),                             dtype=np.float32),
-            "desired_goal":  spaces.Box(-np.inf, np.inf, shape=(7,),                             dtype=np.float32),
-            "obstacles":     spaces.Box(-np.inf, np.inf, shape=(MAX_OBSTACLES * OBS_FEAT_DIM,), dtype=np.float32),
-        })
+        self.observation_space = spaces.Box(
+            -np.inf, np.inf, shape=(self.OBS_DIM,), dtype=np.float32
+        )
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.n_joints,), dtype=np.float32
         )
@@ -246,9 +156,6 @@ class M1013Env(gym.Env):
         self._init_qpos_range = float(np.clip(
             init_range, self.INIT_RANGE_INIT, self.INIT_RANGE_MAX
         ))
-
-    def set_max_obs_count(self, max_obs_count: int):
-        self.max_obs_count = int(np.clip(max_obs_count, 0, MAX_OBSTACLES))
 
     # ── 내부 헬퍼 ────────────────────────────────────────────────────
 
@@ -289,13 +196,21 @@ class M1013Env(gym.Env):
         dot = float(np.clip(abs(np.dot(q1, q2)), 0.0, 1.0))
         return 2.0 * np.arccos(dot)
 
-    def _sample_target_pose(self) -> tuple:
-        """FK 기반으로 도달 가능한 타겟 위치+자세를 동시에 샘플링.
+    def _check_self_collision(self) -> bool:
+        """비인접 로봇 링크 간 자가충돌 감지 (MuJoCo contact 기반)."""
+        for i in range(self.data.ncon):
+            c  = self.data.contact[i]
+            b1 = int(self.model.geom_bodyid[c.geom1])
+            b2 = int(self.model.geom_bodyid[c.geom2])
+            if b1 not in self._robot_body_ids or b2 not in self._robot_body_ids:
+                continue
+            pair = (min(b1, b2), max(b1, b2))
+            if pair not in self._adjacent_body_pairs:
+                return True
+        return False
 
-        같은 관절 설정에서 EE 위치와 자세를 함께 가져오므로
-        반환값은 항상 실제로 도달 가능한 pose임이 보장됨.
-        반환: (pos, quat, goal_qpos) — goal_qpos는 장애물 충돌 가능성 체크에 사용.
-        """
+    def _sample_target_pose(self) -> tuple:
+        """FK 기반으로 도달 가능한 타겟 위치+자세를 동시에 샘플링."""
         saved_qpos   = self.data.qpos.copy()
         current_pos  = self._get_ee_pos()
         current_quat = self._get_ee_quat()
@@ -303,7 +218,6 @@ class M1013Env(gym.Env):
 
         result_pos  = None
         result_quat = None
-        result_qpos = None
         for _ in range(50):
             candidate_qpos = np.array([
                 np.random.uniform(self.JOINT_RANGES[i, 0], self.JOINT_RANGES[i, 1])
@@ -316,7 +230,6 @@ class M1013Env(gym.Env):
             if np.linalg.norm(candidate_pos - current_pos) <= max_dist:
                 result_pos  = candidate_pos
                 result_quat = self._get_ee_quat().copy()
-                result_qpos = candidate_qpos.copy()
                 break
 
         self.data.qpos[:] = saved_qpos
@@ -325,33 +238,8 @@ class M1013Env(gym.Env):
         if result_pos is None:
             result_pos  = current_pos.copy()
             result_quat = current_quat.copy()
-            result_qpos = np.array([saved_qpos[addr] for addr in self.joint_qpos_addr])
 
-        return result_pos, result_quat, result_qpos
-
-    def _is_target_blocked(self) -> bool:
-        """타겟 위치가 활성 장애물과 겹치는지 확인 (EE radius 마진 포함)."""
-        for i in range(MAX_OBSTACLES):
-            if not self._obs_active[i]:
-                continue
-            obs_pos   = self.data.mocap_pos[self._obs_mocap_ids[i]]
-            slot_type = self._obs_active_type[i]
-            params    = self._obs_params[i]
-            if self._dist_point_to_obs(self._target_pos, obs_pos, slot_type, params) < _EE_RADIUS:
-                return True
-        return False
-
-    def _goal_config_collides(self, goal_qpos: np.ndarray) -> bool:
-        """타겟에 도달하는 관절 설정이 현재 장애물 배치와 충돌하는지 확인."""
-        saved_qpos = self.data.qpos.copy()
-        for i, addr in enumerate(self.joint_qpos_addr):
-            self.data.qpos[addr] = goal_qpos[i]
-        mujoco.mj_forward(self.model, self.data)
-        ee_pos = self._get_ee_pos()
-        result = self._check_collision(ee_pos)
-        self.data.qpos[:] = saved_qpos
-        mujoco.mj_forward(self.model, self.data)
-        return result
+        return result_pos, result_quat
 
     def _set_target(self, pos: np.ndarray, quat: np.ndarray):
         self._target_pos  = pos.copy()
@@ -359,217 +247,53 @@ class M1013Env(gym.Env):
         self.data.mocap_pos[self.target_mocap_idx]  = pos
         self.data.mocap_quat[self.target_mocap_idx] = quat
 
-    # ── 장애물 관리 ──────────────────────────────────────────────────
-
-    def _set_slot_rgba(self, i: int, active_type: str):
-        """슬롯 i의 활성 geom을 표시하고 나머지 2개를 투명하게 설정."""
-        geoms = self._obs_geom_ids[i]
-        for t, gid in geoms.items():
-            if t == active_type:
-                self.model.geom_rgba[gid] = _TYPE_RGBA[t]
-            else:
-                self.model.geom_rgba[gid] = [0.0, 0.0, 0.0, 0.0]
-
-    def _hide_slot(self, i: int):
-        """슬롯 i의 모든 geom을 투명하게 설정."""
-        for gid in self._obs_geom_ids[i].values():
-            self.model.geom_rgba[gid] = [0.0, 0.0, 0.0, 0.0]
-
-    def _reset_obstacles(self):
-        """에피소드 시작 시 100개 풀에서 무작위 샘플링 후 장애물 배치."""
-        if self.fixed_obs_count is not None:
-            n_active = int(np.clip(self.fixed_obs_count, 0, MAX_OBSTACLES))
-        else:
-            n_active = np.random.randint(0, self.max_obs_count + 1)
-        # 100개 풀에서 n_active개 비복원 추출
-        sampled_indices = np.random.choice(len(OBSTACLE_POOL), size=n_active, replace=False)
-        active_set = set(range(n_active))
-
-        for i in range(MAX_OBSTACLES):
-            if i < n_active:
-                pool_type, pool_params = OBSTACLE_POOL[sampled_indices[i]]
-
-                pos       = np.random.uniform(OBS_WS_LOW, OBS_WS_HIGH)
-                speed     = np.random.uniform(OBS_MIN_SPEED, OBS_MAX_SPEED)
-                direction = np.random.randn(3)
-                direction /= np.linalg.norm(direction)
-
-                self.data.mocap_pos[self._obs_mocap_ids[i]]  = pos
-                self.data.mocap_quat[self._obs_mocap_ids[i]] = [1, 0, 0, 0]
-
-                # 활성 geom 크기 설정
-                gid = self._obs_geom_ids[i][pool_type]
-                if pool_type == 'sphere':
-                    self.model.geom_size[gid, 0] = float(pool_params[0])
-                elif pool_type == 'box':
-                    self.model.geom_size[gid, :3] = pool_params
-                else:  # capsule
-                    self.model.geom_size[gid, 0] = pool_params[0]
-                    self.model.geom_size[gid, 1] = pool_params[1]
-
-                # rgba: 활성 타입만 표시
-                self._set_slot_rgba(i, pool_type)
-
-                self._obs_active[i]      = True
-                self._obs_vel[i]         = direction * speed
-                self._obs_params[i]      = pool_params.copy()
-                self._obs_active_type[i] = pool_type
-            else:
-                self.data.mocap_pos[self._obs_mocap_ids[i]] = PARK_POS
-                self._hide_slot(i)
-                self._obs_active[i]      = False
-                self._obs_vel[i]         = 0.0
-                self._obs_params[i]      = None
-                self._obs_active_type[i] = None
-
-    def _step_obstacles(self):
-        """매 스텝 활성 장애물 위치 업데이트 (반사 경계)."""
-        for i in range(MAX_OBSTACLES):
-            if not self._obs_active[i]:
-                continue
-
-            pos = self.data.mocap_pos[self._obs_mocap_ids[i]].copy()
-            vel = self._obs_vel[i].copy()
-            new_pos = pos + vel * CONTROL_DT
-
-            for dim in range(3):
-                if new_pos[dim] < OBS_WS_LOW[dim]:
-                    new_pos[dim] = OBS_WS_LOW[dim]
-                    vel[dim]     = abs(vel[dim])
-                elif new_pos[dim] > OBS_WS_HIGH[dim]:
-                    new_pos[dim] = OBS_WS_HIGH[dim]
-                    vel[dim]     = -abs(vel[dim])
-
-            self._obs_vel[i] = vel
-            self.data.mocap_pos[self._obs_mocap_ids[i]] = new_pos
-
-    def _get_obs_obstacles(self) -> np.ndarray:
-        """장애물 관측 벡터 반환 (70D flat). 비활성 슬롯: type=-1, z=-2."""
-        feat = np.zeros((MAX_OBSTACLES, OBS_FEAT_DIM), dtype=np.float32)
-        feat[:, 2] = PARK_POS[2]  # z = -2 for inactive
-        feat[:, 6] = -1.0         # type = -1 for inactive
-
-        for i in range(MAX_OBSTACLES):
-            if not self._obs_active[i]:
-                continue
-            pos       = self.data.mocap_pos[self._obs_mocap_ids[i]]
-            slot_type = self._obs_active_type[i]
-            params    = self._obs_params[i]
-            type_flag = _TYPE_FLAG[slot_type]
-
-            if slot_type == 'sphere':
-                feat[i] = [pos[0], pos[1], pos[2], float(params[0]), 0.0, 0.0, type_flag]
-            elif slot_type == 'box':
-                feat[i] = [pos[0], pos[1], pos[2], params[0], params[1], params[2], type_flag]
-            else:  # capsule
-                feat[i] = [pos[0], pos[1], pos[2], params[0], params[1], 0.0, type_flag]
-
-        return feat.flatten()
-
-    @staticmethod
-    def _dist_point_to_obs(pt: np.ndarray, obs_pos: np.ndarray,
-                           slot_type: str, params: np.ndarray) -> float:
-        """점 pt 에서 장애물 표면까지의 부호 거리.
-        sphere/capsule: 음수=내부, 양수=외부
-        box: 0=내부 또는 표면, 양수=외부 (AABB external distance)
-        """
-        if slot_type == 'sphere':
-            return np.linalg.norm(pt - obs_pos) - float(params[0])
-        elif slot_type == 'box':
-            hx, hy, hz = params
-            dx = max(0.0, abs(pt[0] - obs_pos[0]) - hx)
-            dy = max(0.0, abs(pt[1] - obs_pos[1]) - hy)
-            dz = max(0.0, abs(pt[2] - obs_pos[2]) - hz)
-            return np.sqrt(dx*dx + dy*dy + dz*dz)
-        else:  # capsule (z-axis aligned)
-            radius, half_len = params
-            dp = pt - obs_pos
-            t  = float(np.clip(dp[2], -half_len, half_len))
-            return np.sqrt(dp[0]**2 + dp[1]**2 + (dp[2] - t)**2) - radius
-
-    def _check_collision(self, ee_pos: np.ndarray) -> bool:
-        """로봇 링크(+EE) 전체가 활성 장애물과 겹치면 True.
-
-        체크 포인트:
-          - 7개 링크 body 위치 (보수적 반경 적용)
-          - EE site 위치
-          - link2→link3, link3→link4 긴 세그먼트 중간점 2개씩
-        합계 ~13개 구형 근사 포인트.
-        """
-        # 체크 포인트 구성: (world_pos, link_radius)
-        check_pts = [
-            (self.data.xpos[bid], r)
-            for bid, r in zip(self._link_body_ids, _LINK_RADII)
-        ]
-        check_pts.append((ee_pos, _EE_RADIUS))
-        for bid_a, bid_b, n_mid, r in self._link_segment_checks:
-            pa = self.data.xpos[bid_a]
-            pb = self.data.xpos[bid_b]
-            for k in range(1, n_mid + 1):
-                t = k / (n_mid + 1)
-                check_pts.append((pa + t * (pb - pa), r))
-
-        for i in range(MAX_OBSTACLES):
-            if not self._obs_active[i]:
-                continue
-            obs_pos   = self.data.mocap_pos[self._obs_mocap_ids[i]]
-            slot_type = self._obs_active_type[i]
-            params    = self._obs_params[i]
-
-            for pt, link_r in check_pts:
-                if self._dist_point_to_obs(pt, obs_pos, slot_type, params) < link_r:
-                    return True
-        return False
-
     # ── Observation / Reward ─────────────────────────────────────────
 
-    def _get_obs(self) -> dict:
-        qpos    = self._get_joint_pos()
-        qvel    = self._get_joint_vel()
-        ee_pos  = self._get_ee_pos()
-        ee_quat = self._get_ee_quat()
-        ee_vel  = self._get_ee_vel()
-        robot_obs = np.concatenate([
-            qpos, qvel, ee_pos, ee_quat, ee_vel,
+    def _get_obs(self) -> np.ndarray:
+        """flat 33D 관측 벡터 반환."""
+        return np.concatenate([
+            self._get_joint_pos(),                              # 6D
+            self._get_joint_vel(),                              # 6D
+            self._get_ee_pos(),                                 # 3D
+            self._get_ee_quat(),                                # 4D
+            self._get_ee_vel(),                                 # 7D
+            self._target_pos.astype(np.float32),                # 3D
+            self._target_quat.astype(np.float32),               # 4D
         ]).astype(np.float32)
 
-        return {
-            "observation":   robot_obs,
-            "achieved_goal": np.concatenate([ee_pos, ee_quat]).astype(np.float32),
-            "desired_goal":  np.concatenate([self._target_pos, self._target_quat]).astype(np.float32),
-            "obstacles":     self._get_obs_obstacles(),
-        }
+    def _step_reward(self, obs: np.ndarray) -> tuple:
+        """(reward, success, terminated, dist, angle_err) 반환.
 
-    def compute_reward(self, achieved_goal: np.ndarray,
-                       desired_goal: np.ndarray, info) -> np.ndarray:
-        """HER 재레이블링용 보상 함수 (vectorized). step과 동일한 함수 사용."""
-        pos_dist = np.linalg.norm(
-            achieved_goal[..., :3] - desired_goal[..., :3], axis=-1
-        )
-        q_a = achieved_goal[..., 3:]
-        q_d = desired_goal[..., 3:]
-        norm_a = np.linalg.norm(q_a, axis=-1, keepdims=True)
-        norm_d = np.linalg.norm(q_d, axis=-1, keepdims=True)
-        q_a = q_a / np.where(norm_a > 1e-8, norm_a, 1.0)
-        q_d = q_d / np.where(norm_d > 1e-8, norm_d, 1.0)
-        dot   = np.clip(np.abs(np.sum(q_a * q_d, axis=-1)), 0.0, 1.0)
-        angle = 2.0 * np.arccos(dot)
-        return -(pos_dist + 1.0 * angle).astype(np.float32)
+        보상 구성:
+          1) 거리 보상:      -(pos_dist + angle_error)
+          2) 진행 보상:      (prev_dist - dist) + (prev_angle - angle_err)
+          3) 정지 보상:      proximity × exp(-lin_vel × 5)
+             proximity = clip(1 - dist / success_threshold, 0, 1)
+          4) 성공 보너스:    +10
+          5) 자가충돌 패널티: -5 + terminated
+        """
+        ee_pos  = self._get_ee_pos()
+        ee_quat = self._get_ee_quat()
 
-    def _step_reward(self, obs: dict) -> tuple:
-        """(reward, success, terminated, dist, angle_err) 반환."""
-        achieved = obs["achieved_goal"]
-        desired  = obs["desired_goal"]
-
-        reward = float(self.compute_reward(
-            achieved[np.newaxis], desired[np.newaxis], {}
-        )[0])
-
-        ee_pos    = achieved[:3]
-        ee_quat   = achieved[3:]
         dist      = float(np.linalg.norm(self._target_pos - ee_pos))
         angle_err = self._angle_between_quats(ee_quat, self._target_quat)
 
+        # 1. 거리 보상
+        reward = -(dist + angle_err)
+
+        # 2. 진행 보상
+        reward += (self._prev_dist - dist) + (self._prev_angle_err - angle_err)
+
+        # 3. 정지 보상 (목표 반경 1× 이내, 낮은 선속도일수록 높음)
+        lin_vel   = float(np.linalg.norm(obs[19:22]))
+        proximity = float(np.clip(1.0 - dist / self.success_threshold, 0.0, 1.0))
+        reward   += proximity * float(np.exp(-lin_vel * 5.0))
+
+        # prev 갱신
+        self._prev_dist      = dist
+        self._prev_angle_err = angle_err
+
+        # 성공 판정
         if dist < self.success_threshold and angle_err < self.ori_threshold:
             self._success_steps += 1
         else:
@@ -579,10 +303,10 @@ class M1013Env(gym.Env):
         if success:
             reward += 10.0
 
-        # 장애물 충돌 체크
+        # 자가충돌 패널티
         terminated = False
-        if self._check_collision(ee_pos):
-            reward    -= COLLISION_PENALTY
+        if self._check_self_collision():
+            reward    -= SELF_COLLISION_PENALTY
             terminated = True
 
         return reward, success, terminated, dist, angle_err
@@ -601,20 +325,17 @@ class M1013Env(gym.Env):
             ))
         mujoco.mj_forward(self.model, self.data)
 
-        # 타겟 + 장애물 설정: 타겟이 장애물에 막히지 않을 때까지 재시도
-        target_pos, target_quat, goal_qpos = self._sample_target_pose()
+        target_pos, target_quat = self._sample_target_pose()
         self._set_target(target_pos, target_quat)
-        self._reset_obstacles()
-        for _ in range(4):  # 최대 5회 시도 (초기 1회 + 재시도 4회)
-            if not self._is_target_blocked() and not self._goal_config_collides(goal_qpos):
-                break
-            self._reset_obstacles()
 
         mujoco.mj_forward(self.model, self.data)
         self._step_count    = 0
         self._success_steps = 0
 
         obs = self._get_obs()
+        self._prev_dist      = float(np.linalg.norm(self._target_pos - self._get_ee_pos()))
+        self._prev_angle_err = self._angle_between_quats(self._get_ee_quat(), self._target_quat)
+
         return obs, {
             "target_pos":  self._target_pos.copy(),
             "target_quat": self._target_quat.copy(),
@@ -634,25 +355,22 @@ class M1013Env(gym.Env):
                 self.data.qvel[addr], -self.MAX_QVEL[i], self.MAX_QVEL[i]
             ))
 
-        # 장애물 이동
-        self._step_obstacles()
-
         obs = self._get_obs()
-        reward, success, collision_terminated, dist, angle_err = self._step_reward(obs)
+        reward, success, self_collision, dist, angle_err = self._step_reward(obs)
 
         self._step_count += 1
-        terminated = success or collision_terminated
+        terminated = success or self_collision
         truncated  = self._step_count >= self.max_episode_steps
 
         if self.render_mode == "human":
             self.render()
 
         return obs, reward, terminated, truncated, {
-            "distance":    dist,
-            "angle_error": angle_err,
-            "success":     success,
-            "collision":   collision_terminated,
-            "step":        self._step_count,
+            "distance":       dist,
+            "angle_error":    angle_err,
+            "success":        success,
+            "self_collision": self_collision,
+            "step":           self._step_count,
         }
 
     def render(self):
